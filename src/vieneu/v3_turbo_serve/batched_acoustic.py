@@ -22,7 +22,7 @@ import torch.nn.functional as F
 @torch.no_grad()
 def _sample_batched(
     logits: torch.Tensor, temperature: float, top_k: int, top_p: float,
-    repetition_penalty: float = 1.0, prev=None,
+    repetition_penalty: float = 1.0, prev=None, penalty_mask=None,
 ) -> torch.Tensor:
     """Top-k + top-p sampling over a batch. logits: (B, V) -> codes: (B,).
 
@@ -30,8 +30,20 @@ def _sample_batched(
     codebook; when ``repetition_penalty != 1.0`` those codes are down-weighted on
     each row's logits BEFORE temperature — same CTRL/MOSS rule as the single-path
     ``_sample_token`` (logit<0 → *penalty, else /penalty).
+
+    ``penalty_mask`` (optional, ``(B, V)``) là bản vector-hoá GPU của ``prev``:
+    1 tại mọi code trong cửa sổ gần đây của từng row — áp cùng luật phạt nhưng
+    không phát sinh bất kỳ GPU→CPU sync nào (nhánh ``prev`` phải ``.item()``
+    từng row để dựng index).
     """
-    if not math.isclose(repetition_penalty, 1.0) and prev is not None:
+    if penalty_mask is not None and not math.isclose(repetition_penalty, 1.0):
+        factor = torch.where(
+            penalty_mask > 0,
+            torch.full_like(penalty_mask, repetition_penalty),
+            torch.ones_like(penalty_mask),
+        ).to(logits.dtype)
+        logits = torch.where(logits < 0, logits * factor, logits / factor)
+    elif not math.isclose(repetition_penalty, 1.0) and prev is not None:
         for b, seen in enumerate(prev):
             if seen:
                 idx = torch.as_tensor(sorted(seen), device=logits.device, dtype=torch.long)
@@ -55,6 +67,51 @@ def _sample_batched(
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
+class GpuBatchRepHistory:
+    """Repetition-penalty history cho CẢ BATCH trên một buffer GPU (không sync).
+
+    Thay cho ``[RepetitionHistory(n_vq, w) for _ in range(B)]``: nhánh cũ phải
+    ``int(code[b].item())`` B×n_vq lần mỗi frame (mỗi lần là một GPU→CPU sync).
+    Ngữ nghĩa y hệt: cửa sổ trượt ``window`` frame gần nhất, mỗi kênh 1 code/frame.
+
+    Shape-static như ``GpuRepetitionHistory`` bên ``_v3_turbo_engine`` (count là
+    tensor 0-d trên device, mask quét cả cửa sổ + validity) nên buffer này nằm
+    được bên trong một ``torch.cuda.CUDAGraph`` đã capture.
+    """
+
+    __slots__ = ("codes", "count", "window")
+
+    def __init__(self, batch: int, n_channels: int, window: int, device):
+        self.window = max(1, int(window))
+        self.codes = torch.zeros((batch, n_channels, self.window), dtype=torch.long, device=device)
+        self.count = torch.zeros((), dtype=torch.long, device=device)
+
+    def penalty_mask(self, ch: int, vocab: int, device, dtype=torch.float32):
+        """Mask ``(B, vocab)`` = 1 tại code trong cửa sổ của kênh ``ch`` từng row."""
+        W = self.window
+        recent = self.codes[:, ch, :]                                    # (B, W)
+        valid = torch.arange(W, device=device) < self.count              # (W,)
+        hit = (recent.unsqueeze(2) == torch.arange(vocab, device=device).view(1, 1, -1)) & valid.view(1, -1, 1)
+        return hit.any(dim=1).to(dtype)
+
+    def add(self, ch: int, codes: torch.Tensor) -> None:
+        """codes ``(B,)`` của kênh ``ch`` — ghi in-place, không sync.
+
+        Dùng ``scatter_`` thay vì setitem/index_put_: chỉ scatter_ là được phép
+        bên trong CUDA graph capture (index động qua tensor 0-d count).
+        """
+        pos = (self.count % self.window).view(1, 1).expand(self.codes.shape[0], 1)
+        self.codes[:, ch].scatter_(1, pos, codes.unsqueeze(1))
+
+    def advance(self) -> None:
+        self.count += 1
+
+    def reset(self) -> None:
+        """Xóa lịch sử (đầu mỗi lượt sinh) — in-place, an toàn với CUDA graph."""
+        self.codes.zero_()
+        self.count.zero_()
+
+
 @torch.no_grad()
 def generate_frame_batched(
     model,
@@ -64,7 +121,7 @@ def generate_frame_batched(
     top_k: int = 25,
     top_p: float = 0.95,
     repetition_penalty: float = 1.0,
-    history=None,   # optional list (len B) of per-row RepetitionHistory (indexable by codebook), updated in place
+    history=None,   # optional: GpuBatchRepHistory (không sync) hoặc list (len B) per-row RepetitionHistory (CPU, có sync)
 ):
     """Sample one audio frame for each of B sequences.
 
@@ -86,14 +143,21 @@ def generate_frame_batched(
     B = backbone_hidden.shape[0]
     sgs = cfg.speech_generation_start_token_id
     use_rep = not math.isclose(repetition_penalty, 1.0) and history is not None
+    gpu_hist = history if (use_rep and hasattr(history, "penalty_mask")) else None
+    vocab = cfg.audio_vocab_size
 
     def _sample_ch(ch: int, vec: torch.Tensor) -> torch.Tensor:
         logits = model.audio_lm_heads[ch](vec).float()                            # (B, V)
-        prev = [history[b][ch] for b in range(B)] if use_rep else None
-        code = _sample_batched(logits, temps[ch], top_k, top_p, repetition_penalty, prev)
-        if use_rep:
-            for b in range(B):
-                history[b][ch].add(int(code[b].item()))
+        if gpu_hist is not None:
+            pmask = gpu_hist.penalty_mask(ch, vocab, dev)
+            code = _sample_batched(logits, temps[ch], top_k, top_p, repetition_penalty, penalty_mask=pmask)
+            gpu_hist.add(ch, code)
+        else:
+            prev = [history[b][ch] for b in range(B)] if use_rep else None
+            code = _sample_batched(logits, temps[ch], top_k, top_p, repetition_penalty, prev)
+            if use_rep:
+                for b in range(B):
+                    history[b][ch].add(int(code[b].item()))
         return code
 
     cond = backbone_hidden.to(dt)                                                  # (B, H)
@@ -112,4 +176,6 @@ def generate_frame_batched(
         pos = torch.arange(ch + 1, ch + 2, device=dev, dtype=torch.long)
         hidden, pk, pv = dec.cached_step(emb.view(B, 1, H), pos, pk, pv)
         codes.append(_sample_ch(ch, hidden[:, 0]))
+    if gpu_hist is not None:
+        gpu_hist.advance()
     return torch.stack(codes, dim=1), prefill_out                                  # (B, n_vq), (B, 2, H)

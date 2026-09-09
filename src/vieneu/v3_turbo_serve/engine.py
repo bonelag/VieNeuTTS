@@ -20,9 +20,9 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from .batched_acoustic import generate_frame_batched
+from .batched_acoustic import generate_frame_batched, GpuBatchRepHistory
 from .batched_backbone import BatchedBackbone
-from .._v3_turbo_engine.rep_history import DEFAULT_REP_WINDOW, RepetitionHistory
+from .._v3_turbo_engine.rep_history import DEFAULT_REP_WINDOW
 
 logger = logging.getLogger("Vieneu.V3TurboServe")
 
@@ -55,12 +55,16 @@ class V3TurboBatchEngine:
         self.bb = BatchedBackbone(tts.model)
         self._graphs = {}  # (B, temp, top_k, top_p) -> CudaGraphedFrame (acoustic step)
 
-    def _get_graph(self, B, temperature, top_k, top_p):
-        key = (B, round(temperature, 4), top_k, round(top_p, 4))
+    def _get_graph(self, B, temperature, top_k, top_p, repetition_penalty=1.0,
+                   repetition_window=DEFAULT_REP_WINDOW):
+        key = (B, round(temperature, 4), top_k, round(top_p, 4),
+               round(repetition_penalty, 4), repetition_window)
         if key not in self._graphs:
             from .cudagraph import CudaGraphedFrame
             self._graphs[key] = CudaGraphedFrame(
-                self.model, B, temperature=temperature, top_k=top_k, top_p=top_p
+                self.model, B, temperature=temperature, top_k=top_k, top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                repetition_window=repetition_window,
             )
         return self._graphs[key]
 
@@ -91,7 +95,7 @@ class V3TurboBatchEngine:
         repetition_penalty: float = 1.2,
         repetition_window: int = DEFAULT_REP_WINDOW,
         max_new_frames: int = 300,
-        use_cudagraph: bool = False,
+        use_cudagraph: Optional[bool] = None,
         max_retries: int = 2,
         frame_cap: bool = True,
     ) -> List[np.ndarray]:
@@ -111,10 +115,12 @@ class V3TurboBatchEngine:
         above: a short row that misses its stop token gets truncated at a
         length plausible for its text instead of babbling to ``max_new_frames``.
 
-        ``use_cudagraph=True`` captures (and caches) a CUDA graph of the per-frame
-        acoustic step for this batch size — big per-step speedup, reused across calls.
-        It is ignored when ``repetition_penalty != 1.0`` (the penalty needs dynamic
-        per-row history, which a static graph cannot hold).
+        ``use_cudagraph`` (mặc định ``None`` = auto): ``True`` captures (and
+        caches) a CUDA graph of the per-frame acoustic step for this batch size —
+        big per-step speedup, reused across calls. Auto bật trên CUDA, tắt trên
+        CPU. The repetition penalty runs INSIDE the graph (its sliding-window
+        history is a static GPU buffer with shape-static ops), so it stays
+        available.
         """
         # Fill in phonemes up front so the guard can size-check every row (and so
         # retries don't re-phonemize).
@@ -222,11 +228,20 @@ class V3TurboBatchEngine:
 
         # Per-row, per-codebook sliding-window history for the repetition penalty
         # (matches the single-path decode_one_frame). None when the penalty is disabled.
-        history = ([RepetitionHistory(n_vq, repetition_window) for _ in range(B)]
-                   if not math.isclose(repetition_penalty, 1.0) else None)
-        # CUDA graph bakes in a static step → incompatible with dynamic rep-penalty.
-        use_graph = use_cudagraph and dev.type == "cuda" and math.isclose(repetition_penalty, 1.0)
-        graphed = self._get_graph(B, temperature, top_k, top_p) if use_graph else None
+        # Bản GPU (GpuBatchRepHistory) không phát sinh .item() sync mỗi row/codebook.
+        # CUDA graph giờ gói được cả penalty (history là buffer tĩnh trong graph),
+        # nên bật graph thì dùng history CỦA GRAPH và bỏ bản eager này.
+        # use_cudagraph: None = auto (bật trên CUDA), bool = ép tắt/bật.
+        use_graph = ((dev.type == "cuda") if use_cudagraph is None else bool(use_cudagraph))
+        graphed = (self._get_graph(B, temperature, top_k, top_p, repetition_penalty,
+                                   repetition_window)
+                   if use_graph else None)
+        if graphed is not None:
+            graphed.reset_history()
+            history = None
+        else:
+            history = (GpuBatchRepHistory(B, n_vq, repetition_window, dev)
+                       if not math.isclose(repetition_penalty, 1.0) else None)
 
         h, cache, mask, pos = self.bb.prefill(embeds_list)   # h: (B, H)
         finished = [False] * B
@@ -240,14 +255,18 @@ class V3TurboBatchEngine:
                     self.model, h, temperature=temperature, top_k=top_k, top_p=top_p,
                     repetition_penalty=repetition_penalty, history=history,
                 )
-                is_eos = (self.model.text_lm_head(prefill_out[:, 0]).float().argmax(-1) == eos_id)
+                tl = self.model.text_lm_head(prefill_out[:, 0]).float()
+                is_eos = (tl.argmax(-1) == eos_id) | ((tl[..., eos_id] - tl[..., sgs]) > -1.0)
             for b in range(B):
                 if not finished[b]:
-                    codes_per_req[b].append(codes[b])   # include the EOS frame (matches single path)
-                    if bool(is_eos[b]) or (
-                        frame_caps is not None and len(codes_per_req[b]) >= frame_caps[b]
-                    ):
+                    at_eos = bool(is_eos[b])
+                    at_cap = frame_caps is not None and len(codes_per_req[b]) >= frame_caps[b]
+                    if at_eos and len(codes_per_req[b]) > 0:
                         finished[b] = True
+                    else:
+                        codes_per_req[b].append(codes[b])
+                        if at_eos or at_cap:
+                            finished[b] = True
             if all(finished):
                 break
 

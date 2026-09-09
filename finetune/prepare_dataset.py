@@ -36,9 +36,13 @@ def read_metadata(path: Path, default_speaker: str):
     with open(path, encoding="utf-8") as f:
         for ln, line in enumerate(f, 1):
             line = line.strip()
-            if not line or (ln == 1 and line.lower().startswith("file_name|")):
+            if not line:
+                continue
+            if ln == 1 and any(line.lower().startswith(h) for h in ["file_name|", "audio_file|", "filename|", "audio|", "path|", "id|"]):
                 continue
             parts = line.split("|")
+            if len(parts) < 2 and "\t" in line:
+                parts = line.split("\t")
             if len(parts) < 2:
                 print(f"  skip line {ln}: expected file_name|text")
                 continue
@@ -57,20 +61,36 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset-dir", default=str(ROOT / "finetune" / "dataset"))
     ap.add_argument("--metadata", default=None, help="default: <dataset-dir>/metadata.csv")
-    ap.add_argument("--audio-dir", default=None, help="default: <dataset-dir>/raw_audio")
+    ap.add_argument("--audio-dir", default=None, help="default: <dataset-dir>/raw_audio if exists, else <dataset-dir>")
     ap.add_argument("--out", default=None, help="default: <dataset-dir>/train.parquet")
     ap.add_argument("--speaker", default="my_voice", help="speaker name for lines without a 3rd column")
-    ap.add_argument("--min-sec", type=float, default=1.0)
+    ap.add_argument("--min-sec", type=float, default=0.3, help="shorter clips are skipped (default: 0.3s)")
     ap.add_argument("--max-sec", type=float, default=20.0, help="longer clips are skipped (split them first)")
     ap.add_argument("--base", default="pnnbao-ump/VieNeu-TTS-v3-Turbo", help="model repo (codec + speaker encoder)")
     args = ap.parse_args()
 
     ds_dir = safe_path(args.dataset_dir)
-    meta = safe_path(args.metadata) if args.metadata else ds_dir / "metadata.csv"
-    audio_dir = safe_path(args.audio_dir) if args.audio_dir else ds_dir / "raw_audio"
+    if args.metadata:
+        meta = safe_path(args.metadata)
+    else:
+        for candidate in ["metadata.csv", "metadata.txt", "train.csv"]:
+            if (ds_dir / candidate).is_file():
+                meta = ds_dir / candidate
+                break
+        else:
+            meta = ds_dir / "metadata.csv"
+
+    if args.audio_dir:
+        audio_dir = safe_path(args.audio_dir)
+    elif (ds_dir / "raw_audio").is_dir():
+        audio_dir = ds_dir / "raw_audio"
+    else:
+        audio_dir = ds_dir   # flat structure: audio clips and metadata in the same directory
+
     out = safe_path(args.out) if args.out else ds_dir / "train.parquet"
+    out.parent.mkdir(parents=True, exist_ok=True)
     rows = read_metadata(meta, args.speaker)
-    print(f"{len(rows)} clips listed in {meta}")
+    print(f"{len(rows)} clips listed in {meta} (audio dir: {audio_dir})")
 
     import soundfile as sf
     from vieneu import Vieneu
@@ -80,7 +100,17 @@ def main() -> None:
 
     recs, skipped, t0 = [], 0, time.perf_counter()
     for i, r in enumerate(rows, 1):
-        p = safe_path(r["file_name"], base=audio_dir)
+        # Resolve audio file: check audio_dir, then ds_dir, then meta.parent
+        fname = r["file_name"]
+        p = safe_path(fname, base=audio_dir)
+        if not p.is_file():
+            p2 = safe_path(fname, base=ds_dir)
+            if p2.is_file():
+                p = p2
+            elif meta.parent != ds_dir and (meta.parent / fname).is_file():
+                p = meta.parent / fname
+            elif safe_path(fname).is_file():
+                p = safe_path(fname)
         if not p.is_file():
             print(f"  missing audio: {p}"); skipped += 1; continue
         wav, sr = sf.read(str(p), dtype="float32", always_2d=True)

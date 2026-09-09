@@ -104,13 +104,14 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.base, subfolder=args.subfolder or "", trust_remote_code=True)
     model = load_v3_turbo_checkpoint(args.base, subfolder=args.subfolder or None, device=device, dtype=torch.float32)
     model.config.use_cache = False
+    model.get_input_embeddings = lambda: model.text_embeddings
     for p in model.parameters():
         p.requires_grad_(False)
-    if args.grad_checkpoint:
-        model.semantic_backbone.gradient_checkpointing_enable()
     unfreeze = [s.strip() for s in args.unfreeze.split(",") if s.strip()]
     peft_model = attach_lora(model, r=args.r, alpha=args.alpha, dropout=args.dropout,
                              target=args.target, unfreeze=unfreeze)
+    if args.grad_checkpoint:
+        model.semantic_backbone.gradient_checkpointing_enable()
     n_train = sum(p.numel() for p in trainable_parameters(model))
     n_all = sum(p.numel() for p in model.parameters())
     print(f"trainable params: {n_train/1e6:.2f}M / {n_all/1e6:.1f}M ({100*n_train/n_all:.2f}%)  target={args.target} unfreeze={unfreeze}")

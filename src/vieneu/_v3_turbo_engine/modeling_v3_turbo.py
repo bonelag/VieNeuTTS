@@ -193,8 +193,9 @@ class VieNeuV3TurboForTTS(PreTrainedModel):
             global_hidden_step: backbone hidden state, shape ``(1, hidden_size)``.
             temperature, top_k, audio_top_p, repetition_penalty: sampling controls.
             history_by_channel: optional per-codebook sliding-window history
-                (``RepetitionHistory``) for the repetition penalty; only codes
-                from the recent window are penalised.
+                (``RepetitionHistory`` hoặc ``GpuRepetitionHistory``) for the
+                repetition penalty; only codes from the recent window are
+                penalised. Bản GPU không phát sinh sync nào mỗi codebook.
 
         Returns:
             ``(frame_codes, last_local_out)`` — the ``n_vq`` sampled codes and the
@@ -205,6 +206,10 @@ class VieNeuV3TurboForTTS(PreTrainedModel):
         device = global_hidden_step.device
         local_dtype = next(self.acoustic_decoder.parameters()).dtype
         L = len(self.acoustic_decoder.layers)
+        vocab = self.config.audio_vocab_size
+        # GpuRepetitionHistory → nhánh không-sync; kiểu khác (RepetitionHistory CPU
+        # / None) giữ nguyên đường cũ.
+        gpu_hist = history_by_channel if hasattr(history_by_channel, "penalty_mask") else None
 
         cond = global_hidden_step[0].to(dtype=local_dtype)
         if text_token_id is not None:
@@ -214,6 +219,11 @@ class VieNeuV3TurboForTTS(PreTrainedModel):
             txt = torch.zeros(H, dtype=local_dtype, device=device)
 
         def _sample(ch, vec):
+            if gpu_hist is not None:
+                pmask = gpu_hist.penalty_mask(ch, vocab, device)
+                code = _sample_token(self.audio_lm_heads[ch](vec).float(), temperature=temperature, top_k=top_k, top_p=audio_top_p, repetition_penalty=repetition_penalty, penalty_mask=pmask)
+                gpu_hist.add(ch, code)
+                return code
             prev = history_by_channel[ch] if history_by_channel is not None else None
             code = _sample_token(self.audio_lm_heads[ch](vec).float(), temperature=temperature, top_k=top_k, top_p=audio_top_p, repetition_penalty=repetition_penalty, prev_tokens=prev)
             if history_by_channel is not None:
@@ -223,21 +233,95 @@ class VieNeuV3TurboForTTS(PreTrainedModel):
         # Prefill the two condition tokens (slot 0 = backbone hidden, slot 1 = text),
         # then sample each codebook with a single cached step (lossless vs the full
         # 17-token forward, but O(1) per step instead of O(seq) per step).
+        # Positions tạo bằng arange (kernel trên device) thay vì torch.tensor([...])
+        # (host→device copy) để vòng lặp frame không còn H2D nào.
         tok = torch.stack([cond, txt]).view(1, 2, H)
-        pos = torch.tensor([0, 1], device=device)
+        pos = torch.arange(2, device=device)
         hidden, pk, pv = self.acoustic_decoder.cached_step(tok, pos, [None] * L, [None] * L)
         prefill_out = hidden  # slot-0 output is causal-invariant -> used for the EOS check
 
         sampled_codes = [_sample(0, hidden[0, 1])]
         for ch in range(1, n_vq):
             emb = self.audio_embeddings[ch - 1](sampled_codes[-1].unsqueeze(0))[0].to(dtype=local_dtype)
-            pos = torch.tensor([ch + 1], device=device)
+            pos = torch.arange(ch + 1, ch + 2, device=device)
             hidden, pk, pv = self.acoustic_decoder.cached_step(emb.view(1, 1, H), pos, pk, pv)
             sampled_codes.append(_sample(ch, hidden[0, 0]))
+        if gpu_hist is not None:
+            gpu_hist.advance()
         return (torch.stack(sampled_codes), prefill_out)
 
-def _sample_token(logits: torch.Tensor, temperature: float=1.0, top_k: int=0, top_p: float=1.0, repetition_penalty: float=1.0, prev_tokens=None) -> torch.LongTensor:
-    if not math.isclose(repetition_penalty, 1.0) and prev_tokens:
+class GpuRepetitionHistory:
+    """Sliding-window repetition-penalty history với codes nằm trên GPU (không host-sync).
+
+    Tương đương ``RepetitionHistory`` nhưng buffer là tensor GPU tròn: mỗi frame
+    chỉ ghi tensor 0-d in-place, và penalty áp bằng phép so sánh ma trận vector
+    hoá. Nhánh CPU phải gọi ``int(code.item())`` 16 lần mỗi frame (mỗi codebook
+    một lần) — mỗi ``.item()`` là một GPU→CPU sync, chiếm phần lớn thời gian của
+    vòng lặp sinh audio. Nhánh này không phát sinh sync nào.
+
+    Thiết kế SHAPE-STATIC để capture được trong ``torch.cuda.CUDAGraph``:
+    - ``count`` là tensor 0-d trên device (không phải int host) — tăng bằng
+      phép in-place, graph-capturable.
+    - ``penalty_mask`` luôn quét TOÀN BỘ cửa sổ ``window`` với mask hợp lệ
+      (ô chưa ghi / đã bị trục xuất khỏi cửa sổ thì bỏ qua) — không phụ thuộc
+      count về shape, mọi op đều kernel tĩnh.
+
+    Giữ nguyên ngữ nghĩa cửa sổ trượt: chỉ phạt code xuất hiện trong ``window``
+    frame gần nhất (xem ``rep_history.RepetitionHistory``).
+    """
+
+    __slots__ = ("codes", "count", "window", "n_channels")
+
+    def __init__(self, n_channels: int, window: int, device, dtype=torch.long):
+        self.window = max(1, int(window))
+        self.n_channels = n_channels
+        self.codes = torch.zeros((n_channels, self.window), dtype=dtype, device=device)
+        self.count = torch.zeros((), dtype=torch.long, device=device)   # frame đã thêm
+
+    def penalty_mask(self, ch: int, vocab: int, device, dtype=torch.float32) -> torch.Tensor:
+        """Mask ``(vocab,)`` = 1 tại mọi code trong cửa sổ của kênh ``ch``.
+
+        Trước frame đầu (count=0) mask toàn 0. So sánh ma trận (V, W) với W =
+        window nhỏ (64) nên rẻ hơn nhiều so với chi phí sync của nhánh CPU.
+        """
+        W = self.window
+        recent = self.codes[ch]                                          # (W,)
+        # Ô hợp lệ: đã ghi (vị trí < count khi buffer chưa full) — buffer đã quấn
+        # vòng (count >= W) thì mọi ô đều là code trong cửa sổ gần nhất.
+        valid = torch.arange(W, device=device) < self.count
+        hit = (recent.unsqueeze(0) == torch.arange(vocab, device=device).unsqueeze(1)) & valid
+        return hit.any(dim=1).to(dtype)
+
+    def add(self, ch: int, code: torch.Tensor) -> None:
+        """Ghi code 0-d của kênh ``ch`` vào ô của frame hiện tại (không sync).
+
+        Dùng ``scatter_`` thay vì setitem/index_put_: chỉ scatter_ là được phép
+        bên trong CUDA graph capture (index động qua tensor 0-d count).
+        """
+        pos = (self.count % self.window).view(1)
+        self.codes[ch].scatter_(0, pos, code.view(1))
+
+    def advance(self) -> None:
+        """Frame hiện tại đã thêm đủ mọi kênh → chuyển sang ô kế tiếp."""
+        self.count += 1
+
+    def reset(self) -> None:
+        """Xóa lịch sử (đầu mỗi lượt sinh). In-place trên buffer tĩnh — an toàn
+        cả với buffer nằm bên trong một CUDA graph đã capture."""
+        self.codes.zero_()
+        self.count.zero_()
+
+
+def _sample_token(logits: torch.Tensor, temperature: float=1.0, top_k: int=0, top_p: float=1.0, repetition_penalty: float=1.0, prev_tokens=None, penalty_mask: Optional[torch.Tensor]=None) -> torch.LongTensor:
+    if penalty_mask is not None and not math.isclose(repetition_penalty, 1.0):
+        # Bản vector hoá của nhánh ``prev_tokens`` bên dưới: phạt MỌI index nằm
+        # trong cửa sổ gần đây (mask=1): sel<0 → *p, ngược lại /p. Index ngoài
+        # cửa sổ (mask=0) nhân/chia 1 — giữ nguyên. Toàn bộ trên GPU, không sync.
+        factor = torch.where(penalty_mask > 0,
+                             torch.full_like(penalty_mask, repetition_penalty),
+                             torch.ones_like(penalty_mask)).to(logits.dtype)
+        logits = torch.where(logits < 0, logits * factor, logits / factor)
+    elif not math.isclose(repetition_penalty, 1.0) and prev_tokens:
         idx = torch.as_tensor(sorted(prev_tokens), device=logits.device, dtype=torch.long)
         sel = logits[idx]
         logits = logits.clone()

@@ -3,6 +3,11 @@ text_settings:
   max_total_chars_streaming: 3000
 
 backbone_configs:
+  # Fine-tuned models
+  "VieNeu-TTS-v3-Turbo (Hoạt Ngôn)":
+    repo: finetune/output/hoat_ngon/merged
+    supports_streaming: false
+    description: "🎯 v3 Turbo fine-tuned giọng Hoạt Ngôn (GPU / PyTorch)."
   # v3 Turbo: default for everyone — CPU runs via ONNX, GPU via PyTorch.
   "VieNeu-TTS-v3-Turbo (new release)":
     repo: pnnbao-ump/VieNeu-TTS-v3-Turbo

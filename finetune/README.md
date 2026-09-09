@@ -42,7 +42,7 @@ Script chạy trên CPU, không cần torch: phiên âm bằng sea-g2p, mã hoá
 ## 2. Train LoRA
 
 ```bash
-uv run python finetune/train_lora.py --data finetune/dataset/train.parquet --run my_voice --merge
+uv run python finetune/train_lora.py --data finetune/dataset/train.parquet --run hoat_ngon --merge --no-ref  --text-loss-weight 2.0 
 ```
 
 Mặc định: LoRA rank 16 trên toàn bộ attention và MLP của backbone, learning rate 2e-4, 3 epoch, batch hiệu dụng 16, bf16. Vài tuỳ chọn hay dùng:
@@ -69,7 +69,7 @@ merged/         model đầy đủ, đúng bố cục repo chính thức (khi c�
 ## 3. Merge và dùng model
 
 ```bash
-uv run python finetune/merge_lora.py --adapter finetune/output/my_voice/adapter --out finetune/output/my_voice/merged
+uv run python finetune/merge_lora.py --adapter finetune/output/hoat_ngon/adapter --out finetune/output/hoat_ngon/merged
 # đẩy lên Hugging Face: thêm --push-to-hub your-name/VieNeu-TTS-v3-Turbo-my-voice [--private]
 ```
 

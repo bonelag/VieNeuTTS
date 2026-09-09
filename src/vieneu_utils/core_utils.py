@@ -102,8 +102,7 @@ _FRAME_MARKUP_RE = re.compile(r"<\|emotion_\d+\|>|</?en>")
 # theo số từ: "notification" là một từ nhưng 5 âm tiết, đọc gần 1s — trần 13
 # frame cố định cho "một từ" sẽ cắt cụt nó (xem syllable_count). Đo chunk ngắn
 # (2026-09): 1 tiếng 6-9 frame, 2 tiếng 6-10, 3-4 tiếng 12-15 — trần này còn dư
-# >= 1.5x. Không áp khi có emotion cue (tiếng cười/thở dài tốn frame thật).
-SINGLE_WORD_MAX_FRAMES = 13      # trần cho chunk 1 tiếng (~1s @ 12.5 frame/s)
+SINGLE_WORD_MAX_FRAMES = 8       # trần cho chunk 1 tiếng (~0.64s @ 12.5 frame/s)
 SYLLABLE_CAP_PER_EXTRA = 5       # +frame cho mỗi tiếng thêm
 SYLLABLE_CAP_MAX_SYL = 4         # chunk dài hơn dùng công thức theo phoneme
 _SINGLE_WORD_MAX_PHONES = 24     # phoneme tối đa hợp lý cho MỘT tiếng
@@ -193,6 +192,46 @@ def pause_pad_samples(prev_wav: np.ndarray, next_wav: np.ndarray, sr: int, pause
     return max(0, int(pause_s * sr) - tail - lead)
 
 
+def clean_trailing_ghost_noise(
+    wav: np.ndarray,
+    sr: int,
+    frame_ms: float = 40.0,
+    silence_thresh: float = 0.006,
+    max_burst_ms: float = 240.0,
+) -> np.ndarray:
+    """Loại bỏ nhiễu tàn dư (ghost noise burst) ở đuôi chunk audio v3:
+    Khi model sinh xong tiếng, thường có một khoảng lặng ngắn (< silence_thresh)
+    rồi mới xuất hiện một cụm nhiễu ngẫu nhiên <= 240ms trước khi bắt stop token.
+    Hàm tìm thung lũng im lặng trong khoảng max_burst_ms cuối và cắt bỏ phần nhiễu
+    sau thung lũng, sau đó fade out cosine mượt mép đuôi."""
+    if wav.size == 0:
+        return wav
+    win = int(sr * frame_ms / 1000.0)
+    if win <= 0 or wav.size < win * 3:
+        return wav
+    n_win = wav.size // win
+    env = np.abs(wav[: n_win * win]).reshape(n_win, win).mean(1)
+    max_burst_win = int(max_burst_ms / frame_ms)
+
+    cut_win = n_win
+    for b in range(1, min(max_burst_win + 1, n_win - 1)):
+        idx = n_win - b
+        if env[idx] < silence_thresh:
+            cut_win = idx + 1
+            break
+
+    if cut_win < n_win:
+        out = np.array(wav[: cut_win * win], dtype=np.float32, copy=True)
+    else:
+        out = np.array(wav, dtype=np.float32, copy=True)
+
+    fade_len = min(int(sr * 0.02), out.size // 2)
+    if fade_len > 0:
+        ramp = (0.5 - 0.5 * np.cos(np.linspace(0, np.pi, fade_len))).astype(np.float32)
+        out[-fade_len:] *= ramp[::-1]
+    return out
+
+
 def join_audio_chunks(
     chunks: List[np.ndarray],
     sr: int,
@@ -216,18 +255,21 @@ def join_audio_chunks(
     if not chunks:
         return np.array([], dtype=np.float32)
 
+    # Làm sạch ghost noise ở đuôi mỗi chunk trước khi đo silence / ghép
+    cleaned_chunks = [clean_trailing_ghost_noise(c, sr) for c in chunks]
+
     if silence_ps is not None:
-        parts: List[np.ndarray] = [chunks[0]]
-        for i in range(1, len(chunks)):
+        parts: List[np.ndarray] = [cleaned_chunks[0]]
+        for i in range(1, len(cleaned_chunks)):
             pause_s = silence_ps[i - 1] if i - 1 < len(silence_ps) else 0.0
-            pad = pause_pad_samples(chunks[i - 1], chunks[i], sr, pause_s)
+            pad = pause_pad_samples(cleaned_chunks[i - 1], cleaned_chunks[i], sr, pause_s)
             if pad > 0:
                 parts.append(np.zeros(pad, dtype=np.float32))
-            parts.append(chunks[i])
+            parts.append(cleaned_chunks[i])
         return np.concatenate(parts) if len(parts) > 1 else parts[0]
 
-    if len(chunks) == 1:
-        return chunks[0]
+    if len(cleaned_chunks) == 1:
+        return cleaned_chunks[0]
 
     silence_samples   = int(sr * silence_p)
     crossfade_samples = int(sr * crossfade_p)

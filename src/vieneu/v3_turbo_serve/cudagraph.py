@@ -7,27 +7,41 @@ changes. That makes it capturable as a single ``torch.cuda.CUDAGraph``: replayin
 it advances B sequences by one frame with ONE kernel launch instead of ~16×17
 tiny launches, killing the dispatch overhead that dominates this AR loop.
 
+Repetition penalty is now graph-compatible: the sliding-window history lives in
+a static GPU buffer (``GpuBatchRepHistory``) whose ops are all shape-static, so
+the penalty runs INSIDE the captured graph (``reset()`` between generations
+clears the buffer in place).
+
 Unlike ``torch.compile``, ``torch.cuda.CUDAGraph`` needs no compiler toolchain,
 so it works on Windows + CUDA.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 
-from .batched_acoustic import generate_frame_batched
+from .batched_acoustic import generate_frame_batched, GpuBatchRepHistory
 
 
 class CudaGraphedFrame:
     """Captures ``generate_frame_batched`` (+ EOS check) for a fixed batch B."""
 
     def __init__(self, model, batch_size: int, *, temperature: float, top_k: int,
-                 top_p: float, warmup: int = 3):
+                 top_p: float, repetition_penalty: float = 1.0,
+                 repetition_window: int = 64, warmup: int = 3):
         self.model = model
         self.eos_id = int(model.config.speech_generation_end_token_id)
         dev = next(model.parameters()).device
         H = model.config.hidden_size
         dt = next(model.acoustic_decoder.parameters()).dtype
-        self._sampling = dict(temperature=temperature, top_k=top_k, top_p=top_p)
+        self._sampling = dict(temperature=temperature, top_k=top_k, top_p=top_p,
+                              repetition_penalty=repetition_penalty)
+        # History nằm trong graph: buffer tĩnh, shape-static ops — penalty vẫn
+        # hoạt động y như đường eager (nhánh cũ phải tắt penalty khi capture).
+        self.history = (GpuBatchRepHistory(batch_size, model.config.n_vq,
+                                           repetition_window, dev)
+                        if not math.isclose(repetition_penalty, 1.0) else None)
 
         # Static input buffer (copy each frame's backbone hidden into this).
         self.static_hidden = torch.zeros(batch_size, H, device=dev, dtype=dt)
@@ -40,6 +54,11 @@ class CudaGraphedFrame:
                 self._run_once()
         torch.cuda.current_stream().wait_stream(s)
 
+        # Warmup đã chạy thật (không phải record) nên history bị "bẩn" — xóa
+        # trước khi capture; buffer là static nên zero_() in-place vẫn hợp lệ
+        # với graph đã/thể capture.
+        self.reset_history()
+
         # Capture.
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph), torch.no_grad():
@@ -48,9 +67,17 @@ class CudaGraphedFrame:
             self.static_eos = is_eos
 
     def _run_once(self):
-        codes, prefill_out = generate_frame_batched(self.model, self.static_hidden, **self._sampling)
-        is_eos = self.model.text_lm_head(prefill_out[:, 0]).float().argmax(-1) == self.eos_id
+        codes, prefill_out = generate_frame_batched(
+            self.model, self.static_hidden, history=self.history, **self._sampling)
+        tl = self.model.text_lm_head(prefill_out[:, 0]).float()
+        sgs_id = int(self.model.config.speech_generation_start_token_id)
+        is_eos = (tl.argmax(-1) == self.eos_id) | ((tl[..., self.eos_id] - tl[..., sgs_id]) > -1.0)
         return codes, is_eos
+
+    def reset_history(self) -> None:
+        """Clear the in-graph repetition history (call at generation start)."""
+        if self.history is not None:
+            self.history.reset()
 
     @torch.no_grad()
     def run(self, backbone_hidden: torch.Tensor):

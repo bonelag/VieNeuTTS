@@ -35,6 +35,8 @@ def forward_train(
     n_vq, H = int(cfg.n_vq), int(cfg.hidden_size)
 
     embeds = model._build_inputs_embeds(input_ids, speaker_emb=speaker_emb)
+    if embeds.is_floating_point() and torch.is_grad_enabled():
+        embeds = embeds.requires_grad_(True)
     hidden = model.semantic_backbone(inputs_embeds=embeds, attention_mask=attention_mask,
                                      use_cache=False, return_dict=True).last_hidden_state
     B, T, _ = hidden.shape

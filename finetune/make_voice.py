@@ -18,6 +18,9 @@ from pathlib import Path
 
 import numpy as np
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "finetune"))
@@ -34,7 +37,9 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="merged model folder (or a path ending in .json)")
     ap.add_argument("--base", default="pnnbao-ump/VieNeu-TTS-v3-Turbo", help="repo providing codec + speaker encoder")
     ap.add_argument("--no-denoise", action="store_true")
+    ap.add_argument("--no-ref", action="store_true", help="omit ref codes (for models trained with --no-ref)")
     ap.add_argument("--default", action="store_true", help="make this the default voice of the file")
+    ap.add_argument("--merge-all", action="store_true", help="merge voice into system-wide assets/voices_v3_turbo.json as default preset")
     args = ap.parse_args()
 
     from vieneu import Vieneu
@@ -42,20 +47,42 @@ def main() -> None:
     spk, codes = tts.encode_reference(str(safe_path(args.audio)), denoise=not args.no_denoise)
     spk, codes = np.asarray(spk).reshape(-1), np.asarray(codes)
 
+    voice_entry = {
+        "description": args.description, "gender": args.gender,
+        "speaker_emb": [round(float(x), 6) for x in spk],
+        "codes": [[int(x) for x in row] for row in codes] if not args.no_ref else None,
+    }
+
     path = safe_path(args.out)
     if path.suffix != ".json":
         path = path / "voices_v3_turbo.json"
     data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"presets": {}}
-    data.setdefault("presets", {})[args.name] = {
-        "description": args.description, "gender": args.gender,
-        "speaker_emb": [round(float(x), 6) for x in spk],
-        "codes": [[int(x) for x in row] for row in codes],
-    }
+    data.setdefault("presets", {})[args.name] = voice_entry
     if args.default or not data.get("default_voice"):
         data["default_voice"] = args.name
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"voice '{args.name}' ({codes.shape[0]} ref frames) written to {path}")
+
+    if args.merge_all:
+        sys_path = ROOT / "src" / "vieneu" / "assets" / "voices_v3_turbo.json"
+        if sys_path.is_file():
+            sys_data = json.loads(sys_path.read_text(encoding="utf-8"))
+            sys_data.setdefault("presets", {})[args.name] = voice_entry
+            sys_data["default_voice"] = args.name
+            if "meta" in sys_data and isinstance(sys_data["meta"], dict):
+                sys_data["meta"]["count"] = len(sys_data["presets"])
+            sys_path.write_text(json.dumps(sys_data, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"voice '{args.name}' merged into system assets ({sys_path}) as default preset.")
+
+            # Also update user cache if present
+            user_path = Path.home() / ".vieneu" / "user_voices_v3_turbo.json"
+            if user_path.parent.exists():
+                u_data = json.loads(user_path.read_text(encoding="utf-8")) if user_path.is_file() else {"presets": {}}
+                u_data.setdefault("presets", {})[args.name] = voice_entry
+                u_data["default_voice"] = args.name
+                user_path.write_text(json.dumps(u_data, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(f"voice '{args.name}' synced to user preset cache ({user_path}).")
 
 
 if __name__ == "__main__":

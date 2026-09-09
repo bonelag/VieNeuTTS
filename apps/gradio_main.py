@@ -138,6 +138,11 @@ if HAS_GPU:
         "description": "VieNeu-TTS Version 1 - ổn định, production-ready"
     }
 
+# Giữ lại các model custom/fine-tune khai báo trong config.yaml
+for name, cfg in _config.get("backbone_configs", {}).items():
+    if name not in filtered_backbones and "new release" not in name and "v3-Nano" not in name:
+        filtered_backbones[name] = cfg
+
 BACKBONE_CONFIGS = filtered_backbones
 
 filtered_codecs = {
@@ -987,8 +992,10 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                             return
                         idxs = v3_order[i:i + v3_bs]
                         yield None, f"⚡ v3 Turbo: lô {bi + 1} ({len(idxs)} đoạn, batch size {v3_bs})..."
+                        has_ref = bool(ref_codes is not None and len(ref_codes) > 0)
                         reqs = [{"phonemes": v3_phs[j], "speaker_emb": v3_speaker_emb,
-                                 "ref_codes": ref_codes, "use_ref_codes": True} for j in idxs]
+                                 "ref_codes": ref_codes if has_ref else None,
+                                 "use_ref_codes": has_ref} for j in idxs]
                         for j, w in zip(idxs, tts._v3_batch_engine.generate_batch(
                                 reqs, temperature=temperature, max_new_frames=300)):
                             v3_wavs[j] = w
@@ -1005,6 +1012,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                     v3_wavs = []
                     chunk_durations = []
                     last_t = time.time()
+                    has_ref = bool(ref_codes is not None and len(ref_codes) > 0)
                     for i, chunk in enumerate(v3_chunks):
                         if _STOP_EVENT.is_set():
                             yield None, "⏹️ Đã dừng tạo giọng nói."
@@ -1012,8 +1020,9 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                         yield None, f"⏳ {v3_label}: Đang xử lý đoạn {i + 1}/{total_v3}..."
                         ph = phonemize_text_with_emotions(chunk)
                         chunk_wav = tts.engine.infer(
-                            phonemes=ph, speaker_emb=v3_speaker_emb, ref_codes=ref_codes,
-                            use_ref_codes=True,
+                            phonemes=ph, speaker_emb=v3_speaker_emb,
+                            ref_codes=ref_codes if has_ref else None,
+                            use_ref_codes=has_ref,
                             temperature=temperature, max_new_frames=300)
                         now = time.time()
                         chunk_durations.append(now - last_t)
@@ -1470,9 +1479,10 @@ def _synthesize_conversation_v3(lines, mapping, temperature, max_chars_chunk, si
         # phonemize từng chunk. Hội thoại luôn dùng phong cách Tự nhiên.
         line_chunks, line_gaps[li] = normalize_to_chunks_v3_with_gaps(line['text'], max_chars=max_chars_chunk)
         for chunk in line_chunks:
+            has_ref = bool(ref_codes is not None and len(ref_codes) > 0)
             reqs.append({"phonemes": phonemize_text_with_emotions(chunk),
-                         "speaker_emb": spk_emb, "ref_codes": ref_codes,
-                         "use_ref_codes": True})
+                         "speaker_emb": spk_emb, "ref_codes": ref_codes if has_ref else None,
+                         "use_ref_codes": has_ref})
             req_line.append(li)
 
     if not reqs:

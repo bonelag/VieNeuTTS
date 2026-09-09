@@ -29,8 +29,8 @@ import torch
 _STREAM_LEADIN_FRAMES = 4
 from .configuration_v3_turbo import VieNeuV3TurboConfig
 from .hub_load_v3_turbo import load_v3_turbo_checkpoint
-from .modeling_v3_turbo import VieNeuV3TurboForTTS, _sample_token
-from .rep_history import DEFAULT_REP_WINDOW, RepetitionHistory
+from .modeling_v3_turbo import VieNeuV3TurboForTTS, _sample_token, GpuRepetitionHistory
+from .rep_history import DEFAULT_REP_WINDOW
 from vieneu_utils.core_utils import BABBLE_MAX_RETRIES, babble_suspect, babble_prefer, babble_log_line
 import logging
 
@@ -213,14 +213,68 @@ class VieNeuTTSv3Turbo:
             yield from self._stream_generate(prompt_2d, spk_t, temperature, top_k, top_p, max_new_frames, chunk_frames, repetition_penalty=repetition_penalty, repetition_window=repetition_window)
 
     # ── Generation core ─────────────────────────────────────────────────────────
+    # Slot row (1,1,n_vq+1) của frame được ghi trực tiếp trong vòng lặp:
+    # cột 0 = sgs_id, hàng 0 cột 1.. = frame_codes — phủ TOÀN BỘ buffer nên dùng
+    # lại được mỗi frame (xem _generate_codes / _stream_generate).
 
-    @staticmethod
-    def _prepare_gen_slot_row(slot_row: torch.Tensor, frame_codes: Optional[torch.Tensor], sgs_id: int, audio_pad: int) -> None:
-        slot_row[:, :, 0] = sgs_id
-        if frame_codes is None:
-            slot_row[:, :, 1:] = audio_pad
-        else:
-            slot_row[:, 0, 1:] = frame_codes.to(slot_row.device)
+    def _get_graphed_frame(self, temperature: float, top_k: int, top_p: float,
+                           repetition_penalty: float, repetition_window: int):
+        """``CudaGraphedFrame`` (B=1) cho bước acoustic — cache theo tham số sampling.
+
+        Trả ``None`` khi không trên CUDA hoặc capture thất bại (fallback đường
+        eager, kết quả tương đương). Graph gói cả repetition penalty (history
+        nằm trong buffer tĩnh bên trong graph) nên giữ nguyên chất lượng.
+        """
+        if str(getattr(self.device, "type", "")) != "cuda":
+            return None
+        cache = getattr(self, "_frame_graphs", None)
+        if cache is None:
+            cache = self._frame_graphs = {}
+        key = (round(float(temperature), 4), int(top_k), round(float(top_p), 4),
+               round(float(repetition_penalty), 4), int(repetition_window))
+        g = cache.get(key)
+        if g is None:
+            try:
+                from ..v3_turbo_serve.cudagraph import CudaGraphedFrame
+                g = CudaGraphedFrame(self.model, 1, temperature=temperature, top_k=top_k,
+                                     top_p=top_p, repetition_penalty=repetition_penalty,
+                                     repetition_window=repetition_window)
+            except Exception as e:   # noqa: BLE001 — capture lỗi thì dùng eager
+                logging.getLogger("Vieneu.V3Turbo").warning(
+                    f"CUDA graph capture thất bại — dùng đường eager: {e}")
+                g = False
+            cache[key] = g
+        return g or None
+
+    def _get_graphed_step(self, temperature: float, top_k: int, top_p: float,
+                          repetition_penalty: float, repetition_window: int):
+        """``GraphedFrameStep`` — MỘT CUDA graph cho cả frame (acoustic + backbone).
+
+        Cache theo tham số sampling; ``None`` khi không trên CUDA, prompt dài
+        quá StaticCache, hoặc capture thất bại (fallback các đường chậm hơn).
+        """
+        if str(getattr(self.device, "type", "")) != "cuda":
+            return None
+        cache = getattr(self, "_step_graphs", None)
+        if cache is None:
+            cache = self._step_graphs = {}
+        key = (round(float(temperature), 4), int(top_k), round(float(top_p), 4),
+               round(float(repetition_penalty), 4), int(repetition_window))
+        g = cache.get(key)
+        if g is None:
+            try:
+                from ..v3_turbo_serve.graphed_step import GraphedFrameStep
+                max_len = int(getattr(self.config, "max_position_embeddings", 1024))
+                g = GraphedFrameStep(self.model, max_cache_len=max_len,
+                                     temperature=temperature, top_k=top_k, top_p=top_p,
+                                     repetition_penalty=repetition_penalty,
+                                     repetition_window=repetition_window)
+            except Exception as e:   # noqa: BLE001 — capture lỗi thì dùng đường chậm hơn
+                logging.getLogger("Vieneu.V3Turbo").warning(
+                    f"Full-frame CUDA graph capture thất bại — fallback acoustic-graph: {e}")
+                g = False
+            cache[key] = g
+        return g or None
 
     @torch.no_grad()
     def _generate_codes(self, phonemes, text, ref_codes, speaker_emb, style, use_ref_codes, temperature, top_k, top_p, max_new_frames, repetition_penalty: float=1.2, repetition_window: int=DEFAULT_REP_WINDOW) -> torch.LongTensor:
@@ -231,44 +285,96 @@ class VieNeuTTSv3Turbo:
         prompt_2d = self._build_prompt_2d(phonemes, text, ref_codes, style_id)
         input_2d = prompt_2d.unsqueeze(0).to(self.device)
         prefill_embeds = self.model._build_inputs_embeds(input_2d, speaker_emb=spk_t)
+
+        # ── Đường nhanh nhất: MỘT CUDA graph cho cả frame (acoustic + backbone,
+        # StaticCache) — 1 replay + 1 sync/frame. Giữ nguyên repetition penalty.
+        step_g = self._get_graphed_step(temperature, top_k, top_p, repetition_penalty, repetition_window)
+        if step_g is not None and prefill_embeds.shape[1] + max_new_frames <= step_g.max_cache_len:
+            step_g.begin(prefill_embeds, spk_t)
+            all_codes: List[torch.LongTensor] = []
+            for _ in range(max_new_frames):
+                step_g.step()
+                if step_g.is_eos() and len(all_codes) > 0:
+                    break
+                all_codes.append(step_g.codes())
+            if not all_codes:
+                return torch.zeros(0, self.config.n_vq, dtype=torch.long)
+            return torch.stack(all_codes).cpu()
+
         prefill_out = self.model.semantic_backbone(inputs_embeds=prefill_embeds, use_cache=True, return_dict=True)
         past_kv = prefill_out.past_key_values
         h = prefill_out.last_hidden_state[:, -1]
+        # Codes giữ trên GPU suốt vòng lặp (chuyển .cpu() ĐÚNG 1 lần ở cuối) —
+        # từng frame cũ phải .cpu() là một GPU→CPU sync không cần thiết.
         all_codes: List[torch.LongTensor] = []
         eos_id = self.config.speech_generation_end_token_id
         sgs_id = self.config.speech_generation_start_token_id
         n_vq = self.config.n_vq
         audio_pad = self.config.audio_pad_token_id
-        hist = RepetitionHistory(n_vq, repetition_window) if not math.isclose(repetition_penalty, 1.0) else None
+        # CUDA graph cho bước acoustic (1 replay/frame thay ~300 kernel launch).
+        # Giữ nguyên repetition penalty — history nằm trong graph. Eager fallback.
+        graphed = self._get_graphed_frame(temperature, top_k, top_p, repetition_penalty, repetition_window)
+        if graphed is not None:
+            graphed.reset_history()
+            hist = None
+        else:
+            # GPU history: penalty vẫn bật nhưng không còn .item() mỗi codebook.
+            hist = GpuRepetitionHistory(n_vq, repetition_window, self.device) if not math.isclose(repetition_penalty, 1.0) else None
+        # Buffer dùng lại mỗi frame (slot_row (1,1,n_vq+1) được ghi ĐẦY ĐỦ cột 0
+        # + hàng 0 cột 1.. mỗi frame nên không có dữ liệu cũ sót lại).
+        sgs_t = torch.tensor([sgs_id], device=self.device)
+        slot_row = torch.empty((1, 1, n_vq + 1), dtype=torch.long, device=self.device)
         for _ in range(max_new_frames):
-            frame_codes, last_local_out = self.model.decode_one_frame(h, text_token_id=torch.tensor([sgs_id], device=self.device), temperature=temperature, top_k=top_k, audio_top_p=top_p, repetition_penalty=repetition_penalty, history_by_channel=hist)
-            all_codes.append(frame_codes.cpu())
-            text_logits = self.model.text_lm_head(last_local_out[0, 0]).float()
-            if int(text_logits.argmax().item()) == eos_id:
-                break
-            slot_row = torch.full((1, 1, n_vq + 1), audio_pad, dtype=torch.long, device=self.device)
-            self._prepare_gen_slot_row(slot_row, frame_codes=frame_codes, sgs_id=sgs_id, audio_pad=audio_pad)
+            if graphed is not None:
+                frame_codes, is_eos = graphed.run(h)
+                frame_codes = frame_codes[0]   # (1, n_vq) -> (n_vq,) như đường eager
+                if bool(is_eos.reshape(-1)[0]) and len(all_codes) > 0:
+                    break
+                all_codes.append(frame_codes)
+            else:
+                frame_codes, last_local_out = self.model.decode_one_frame(h, text_token_id=sgs_t, temperature=temperature, top_k=top_k, audio_top_p=top_p, repetition_penalty=repetition_penalty, history_by_channel=hist)
+                text_logits = self.model.text_lm_head(last_local_out[0, 0]).float()
+                if (int(text_logits.argmax().item()) == eos_id or (text_logits[eos_id] - text_logits[sgs_id] > -1.0)) and len(all_codes) > 0:
+                    break
+                all_codes.append(frame_codes)
+            slot_row[:, :, 0] = sgs_id
+            slot_row[:, 0, 1:] = frame_codes
             slot_embed = self.model._build_inputs_embeds(slot_row, speaker_emb=spk_t)
             step_out = self.model.semantic_backbone(inputs_embeds=slot_embed, past_key_values=past_kv, use_cache=True, return_dict=True)
             past_kv = step_out.past_key_values
             h = step_out.last_hidden_state[:, 0]
         if not all_codes:
             return torch.zeros(0, self.config.n_vq, dtype=torch.long)
-        return torch.stack(all_codes)
+        return torch.stack(all_codes).cpu()
 
     @torch.no_grad()
     def _stream_generate(self, prompt_2d, spk_t, temperature, top_k, top_p, max_new_frames, chunk_frames, repetition_penalty: float=1.2, repetition_window: int=DEFAULT_REP_WINDOW) -> Generator[np.ndarray, None, None]:
         input_2d = prompt_2d.unsqueeze(0).to(self.device)
         prefill_embeds = self.model._build_inputs_embeds(input_2d, speaker_emb=spk_t)
-        prefill_out = self.model.semantic_backbone(inputs_embeds=prefill_embeds, use_cache=True, return_dict=True)
-        past_kv = prefill_out.past_key_values
-        h = prefill_out.last_hidden_state[:, -1]
         eos_id = self.config.speech_generation_end_token_id
         sgs_id = self.config.speech_generation_start_token_id
         n_vq = self.config.n_vq
-        audio_pad = self.config.audio_pad_token_id
+        # Đường nhanh nhất: full-frame CUDA graph (acoustic + backbone, 1 replay/frame).
+        step_g = self._get_graphed_step(temperature, top_k, top_p, repetition_penalty, repetition_window)
+        use_step_g = step_g is not None and prefill_embeds.shape[1] + max_new_frames <= step_g.max_cache_len
+        if use_step_g:
+            step_g.begin(prefill_embeds, spk_t)
+            past_kv = None
+            h = None
+        else:
+            prefill_out = self.model.semantic_backbone(inputs_embeds=prefill_embeds, use_cache=True, return_dict=True)
+            past_kv = prefill_out.past_key_values
+            h = prefill_out.last_hidden_state[:, -1]
+            # Fallback: CUDA graph chỉ cho bước acoustic, hoặc eager với GPU history.
+            graphed = self._get_graphed_frame(temperature, top_k, top_p, repetition_penalty, repetition_window)
+            if graphed is not None:
+                graphed.reset_history()
+                hist = None
+            else:
+                hist = GpuRepetitionHistory(n_vq, repetition_window, self.device) if not math.isclose(repetition_penalty, 1.0) else None
         buffer: List[torch.LongTensor] = []
-        hist = RepetitionHistory(n_vq, repetition_window) if not math.isclose(repetition_penalty, 1.0) else None
+        sgs_t = torch.tensor([sgs_id], device=self.device)
+        slot_row = torch.empty((1, 1, n_vq + 1), dtype=torch.long, device=self.device)
         sr = self.SAMPLE_RATE
         first_decode = True
         emitted_samples = 0
@@ -288,17 +394,30 @@ class VieNeuTTSv3Turbo:
             return cap
         try:
             for _ in range(max_new_frames):
-                frame_codes, last_local_out = self.model.decode_one_frame(h, text_token_id=torch.tensor([sgs_id], device=self.device), temperature=temperature, top_k=top_k, audio_top_p=top_p, repetition_penalty=repetition_penalty, history_by_channel=hist)
-                buffer.append(frame_codes.cpu())
-                text_logits = self.model.text_lm_head(last_local_out[0, 0]).float()
-                if int(text_logits.argmax().item()) == eos_id:
-                    break
-                slot_row = torch.full((1, 1, n_vq + 1), audio_pad, dtype=torch.long, device=self.device)
-                self._prepare_gen_slot_row(slot_row, frame_codes=frame_codes, sgs_id=sgs_id, audio_pad=audio_pad)
-                slot_embed = self.model._build_inputs_embeds(slot_row, speaker_emb=spk_t)
-                step_out = self.model.semantic_backbone(inputs_embeds=slot_embed, past_key_values=past_kv, use_cache=True, return_dict=True)
-                past_kv = step_out.past_key_values
-                h = step_out.last_hidden_state[:, 0]
+                if use_step_g:
+                    step_g.step()
+                    buffer.append(step_g.codes())
+                    if step_g.is_eos():
+                        break
+                else:
+                    if graphed is not None:
+                        frame_codes, is_eos = graphed.run(h)
+                        frame_codes = frame_codes[0]   # (1, n_vq) -> (n_vq,) như đường eager
+                        buffer.append(frame_codes)
+                        if bool(is_eos.reshape(-1)[0]):
+                            break
+                    else:
+                        frame_codes, last_local_out = self.model.decode_one_frame(h, text_token_id=sgs_t, temperature=temperature, top_k=top_k, audio_top_p=top_p, repetition_penalty=repetition_penalty, history_by_channel=hist)
+                        buffer.append(frame_codes)
+                        text_logits = self.model.text_lm_head(last_local_out[0, 0]).float()
+                        if int(text_logits.argmax().item()) == eos_id:
+                            break
+                    slot_row[:, :, 0] = sgs_id
+                    slot_row[:, 0, 1:] = frame_codes
+                    slot_embed = self.model._build_inputs_embeds(slot_row, speaker_emb=spk_t)
+                    step_out = self.model.semantic_backbone(inputs_embeds=slot_embed, past_key_values=past_kv, use_cache=True, return_dict=True)
+                    past_kv = step_out.past_key_values
+                    h = step_out.last_hidden_state[:, 0]
                 if len(buffer) >= _target_frames():
                     wav = self._decode_codes_stream(torch.stack(buffer), reset=first_decode)
                     first_decode = False
