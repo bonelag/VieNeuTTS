@@ -3,16 +3,11 @@ text_settings:
   max_total_chars_streaming: 3000
 
 backbone_configs:
-  # Fine-tuned models
-  "VieNeu-TTS-v3-Turbo (Hoạt Ngôn)":
-    repo: finetune/output/hoat_ngon/merged
-    supports_streaming: false
-    description: "🎯 v3 Turbo fine-tuned giọng Hoạt Ngôn (GPU / PyTorch)."
   # v3 Turbo: default for everyone — CPU runs via ONNX, GPU via PyTorch.
-  "VieNeu-TTS-v3-Turbo (new release)":
+  "VieNeu-TTS-v3-Turbo (Base)":
     repo: pnnbao-ump/VieNeu-TTS-v3-Turbo
     supports_streaming: false
-    description: "🆕 v3 Turbo (early access) — 48kHz. CPU dùng ONNX; GPU dùng PyTorch. Giọng mặc định qua speaker token; Voice Cloning từ audio mẫu; hỗ trợ tag cảm xúc (thử nghiệm). Bản dùng thử; v3 đầy đủ sẽ ra mắt trong vài tuần tới."
+    description: "🆕 v3 Turbo — 48kHz. CPU dùng ONNX; GPU dùng PyTorch. Giọng mặc định qua speaker token; Voice Cloning từ audio mẫu; hỗ trợ tag cảm xúc (thử nghiệm). Bản dùng thử; v3 đầy đủ sẽ ra mắt trong vài tuần tới."
   # v3 Nano (PREVIEW): edge devices / weak CPUs only. 24 kHz, preset voices only, much weaker EN/bilingual.
   "VieNeu-TTS-v3-Nano (preview)":
     repo: pnnbao-ump/VieNeu-TTS-v3-Nano

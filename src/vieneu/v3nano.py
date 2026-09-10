@@ -79,6 +79,14 @@ class OnnxV3NanoEngine:
 
         self._lock = threading.RLock()
         self.device = _Dev()
+        if local_dir is None:
+            try:
+                from vieneu_utils.model_manager import ensure_model
+                p_nano = ensure_model(repo, category="backbone", check_update=False)
+                if p_nano.is_dir():
+                    local_dir = str(p_nano)
+            except Exception:
+                pass
         self.repo, self.local_dir, self.hf_token = repo, local_dir, hf_token
         d = Path(local_dir) if local_dir else self._fetch(repo, hf_token)
         self.cfg = json.loads((d / "config.json").read_text(encoding="utf-8"))
@@ -133,7 +141,7 @@ class OnnxV3NanoEngine:
     # ── voice cloning: reference clip -> (x-vector, style tokens) ─────────────
     def _clone_file(self, fn: str, repo: Optional[str] = None) -> str:
         """Resolve a cloning artifact from ``local_dir`` (if given) or the HF repo."""
-        if self.local_dir and repo is None:
+        if self.local_dir:
             p = Path(self.local_dir) / fn
             if p.is_file():
                 return str(p)

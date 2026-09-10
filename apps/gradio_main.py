@@ -14,13 +14,23 @@ import soundfile as sf
 import tempfile
 from vieneu import Vieneu
 import os
+from pathlib import Path
+
+# Portable environment setup
+_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.path.join(_PROJECT_DIR, "finetune") not in sys.path:
+    sys.path.insert(0, os.path.join(_PROJECT_DIR, "finetune"))
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+os.environ.setdefault("HF_HOME", os.path.join(_PROJECT_DIR, "model", ".hf_home"))
 import time
 import numpy as np
 import queue
 import threading
 import yaml
+import json
 import uuid
-from vieneu_utils.core_utils import join_audio_chunks, env_bool, get_silence_duration_v2, gaps_to_silence
+from vieneu_utils.core_utils import join_audio_chunks, env_bool, get_silence_duration_v2, gaps_to_silence, time_stretch_audio
 from vieneu_utils.phonemize_text import phonemize_to_chunks, normalize_to_chunks, normalize_to_chunks_v3, normalize_to_chunks_v3_with_gaps
 # PuncNormalizer = sea_g2p.Normalizer luôn bật punc_norm=True.
 from vieneu_utils.phonemize_text import PuncNormalizer as Normalizer
@@ -92,56 +102,45 @@ def _watermark_available() -> bool:
         return False
 
 
-# VieNeu-TTS v3 Turbo — the DEFAULT on both CPU and GPU (first entry = default in the UI).
-# CPU runs the fp32 ONNX graphs (maximum quality); GPU runs PyTorch.
-filtered_backbones["VieNeu-TTS-v3-Turbo"] = {
-    "repo": "pnnbao-ump/VieNeu-TTS-v3-Turbo",
-    "precision": "fp32",
-    "supports_streaming": False,
-    "description": (
-        "🆕 v3 Turbo — 48kHz, bản mặc định. Giọng mặc định dùng speaker token (ổn định hơn); Voice Cloning "
-        "clone từ audio mẫu; tag cảm xúc [cười]/[hắng giọng]/[thở dài] (thử nghiệm)."
-        + ("" if HAS_GPU else " Trên CPU chạy ONNX fp32 (chất lượng tối đa).")
-    )
-}
-if not HAS_GPU:
-    filtered_backbones["VieNeu-TTS-v3-Turbo (int8)"] = {
+user_backbones = _config.get("backbone_configs", {})
+if user_backbones:
+    # Tôn trọng cấu hình và thứ tự khai báo trong config.yaml của người dùng
+    filtered_backbones = dict(user_backbones)
+else:
+    # Cấu hình mặc định khi config.yaml trống
+    filtered_backbones["VieNeu-TTS-v3-Turbo"] = {
         "repo": "pnnbao-ump/VieNeu-TTS-v3-Turbo",
-        "precision": "int8",
+        "precision": "fp32",
         "supports_streaming": False,
-        "description": "v3 Turbo (int8) — 48kHz, backbone nén int8: nhanh hơn bản fp32 trên CPU có AVX-512/AVX-VNNI (CPU cũ không có VNNI có thể bị méo tiếng). Cùng giọng, cloning và tag cảm xúc như bản mặc định."
+        "description": (
+            "🆕 v3 Turbo — 48kHz, bản mặc định. Giọng mặc định dùng speaker token; Voice Cloning "
+            "clone từ audio mẫu; tag cảm xúc [cười]/[hắng giọng]/[thở dài] (thử nghiệm)."
+            + ("" if HAS_GPU else " Trên CPU chạy ONNX fp32 (chất lượng tối đa).")
+        )
     }
-# VieNeu-TTS v3 Nano (PREVIEW) — ONNX/CPU only. NOT the default: a 48M-param flow model for
-# edge devices (Android, weak CPUs). Listed last so Turbo stays the first/default entry.
-filtered_backbones["VieNeu-TTS-v3-Nano (preview)"] = {
-    "repo": "pnnbao-ump/VieNeu-TTS-v3-Nano",
-    "supports_streaming": False,
-    "description": (
-        "🪶 v3 Nano (PREVIEW, đang thử nghiệm) — 24kHz, model flow 48M tham số, chạy RẤT NHANH, dành cho "
-        "edge device (Android) hoặc CPU yếu. Chất lượng KÉM HƠN NHIỀU so với v3 Turbo, nhất là tiếng Anh và "
-        "câu song ngữ; chỉ 6 giọng có sẵn, KHÔNG clone giọng; còn nhiều thiếu sót. Chỉ dùng khi thực sự cần "
-        "tốc độ hoặc deploy trên điện thoại."
-    )
-}
-
-# GPU-only extras. On GPU the default is VieNeu-TTS-v2 (GPU); v3 Turbo stays the
-# default (and only option) on CPU machines (the v2/v1 GGUF CPU builds were removed).
-if HAS_GPU:
-    filtered_backbones["VieNeu-TTS-v2 (GPU)"] = {
-        "repo": "pnnbao-ump/VieNeu-TTS-v2",
+    if not HAS_GPU:
+        filtered_backbones["VieNeu-TTS-v3-Turbo (int8)"] = {
+            "repo": "pnnbao-ump/VieNeu-TTS-v3-Turbo",
+            "precision": "int8",
+            "supports_streaming": False,
+            "description": "v3 Turbo (int8) — 48kHz, backbone nén int8."
+        }
+    filtered_backbones["VieNeu-TTS-v3-Nano (preview)"] = {
+        "repo": "pnnbao-ump/VieNeu-TTS-v3-Nano",
         "supports_streaming": False,
-        "description": "VieNeu-TTS Version 2 - hỗ trợ song ngữ (Anh-Việt) và chế độ podcast"
+        "description": "🪶 v3 Nano (PREVIEW, đang thử nghiệm) — 24kHz, 48M tham số cho CPU/máy yếu."
     }
-    filtered_backbones["VieNeu-TTS (GPU)"] = {
-        "repo": "pnnbao-ump/VieNeu-TTS",
-        "supports_streaming": False,
-        "description": "VieNeu-TTS Version 1 - ổn định, production-ready"
-    }
-
-# Giữ lại các model custom/fine-tune khai báo trong config.yaml
-for name, cfg in _config.get("backbone_configs", {}).items():
-    if name not in filtered_backbones and "new release" not in name and "v3-Nano" not in name:
-        filtered_backbones[name] = cfg
+    if HAS_GPU:
+        filtered_backbones["VieNeu-TTS-v2 (GPU)"] = {
+            "repo": "pnnbao-ump/VieNeu-TTS-v2",
+            "supports_streaming": False,
+            "description": "VieNeu-TTS Version 2 - hỗ trợ song ngữ (Anh-Việt)"
+        }
+        filtered_backbones["VieNeu-TTS (GPU)"] = {
+            "repo": "pnnbao-ump/VieNeu-TTS",
+            "supports_streaming": False,
+            "description": "VieNeu-TTS Version 1 - ổn định"
+        }
 
 BACKBONE_CONFIGS = filtered_backbones
 
@@ -176,11 +175,25 @@ if not BACKBONE_CONFIGS or not CODEC_CONFIGS:
 tts = None
 current_backbone = None
 current_codec = None
+current_adapter = "Không"
 model_loaded = False
 using_lmdeploy = False
 PRESET_VOICES_CACHE = []  # List of all voices (tuples or strings)
 CONV_VOICES_CACHE = []    # Filtered list for conversation (podcast=True)
 MAX_SPEAKERS = 8          # Max concurrent speakers in conversation tab
+
+def scan_available_adapters() -> list[str]:
+    """Scan finetune/output/*/adapter for valid LoRA adapters."""
+    base_dir = Path(_PROJECT_DIR) / "finetune" / "output"
+    adapters = ["Không"]
+    if not base_dir.is_dir():
+        return adapters
+    for p in sorted(base_dir.iterdir()):
+        if p.is_dir():
+            adapter_dir = p / "adapter"
+            if adapter_dir.is_dir() and ((adapter_dir / "adapter_model.safetensors").is_file() or (adapter_dir / "adapter_config.json").is_file()):
+                adapters.append(p.name)
+    return adapters
 
 # Normalizer (module-level singleton)
 _text_normalizer = Normalizer()
@@ -212,7 +225,7 @@ def _supports_cloning(backbone_choice: str) -> bool:
 
 def get_model_status_message() -> str:
     """Reconstruct status message from global state"""
-    global model_loaded, tts, using_lmdeploy, current_backbone, current_codec
+    global model_loaded, tts, using_lmdeploy, current_backbone, current_codec, current_adapter
     if not model_loaded or tts is None:
         return "⏳ Chưa tải model."
     
@@ -252,11 +265,13 @@ def get_model_status_message() -> str:
             f"\n  • Prefix Caching: ❌"
         )
 
+    adapter_str = f"\n🧩 LoRA Adapter: {current_adapter}" if (current_adapter and current_adapter != "Không") else ""
+
     return (
         f"✅ Model đã tải thành công!\n\n"
         f"🔧 Backend: {backend_name}\n"
-        f" Parrot: {current_backbone} on {device_info}\n"
-        f"🎵 Codec: {current_codec} on {codec_device}{preencoded_note}{opt_info}"
+        f"🦜 Parrot: {current_backbone} on {device_info}\n"
+        f"🎵 Codec: {current_codec} on {codec_device}{adapter_str}{preencoded_note}{opt_info}"
     )
 
 def restore_ui_state():
@@ -295,11 +310,12 @@ def should_use_lmdeploy(backbone_choice: str, device_choice: str) -> bool:
 
 def load_model(backbone_choice: str, codec_choice: str, device_choice: str, 
                force_lmdeploy: bool, custom_model_id: str = "", custom_base_model: str = "", 
-               custom_hf_token: str = ""):
+               custom_hf_token: str = "", adapter_choice: str = "Không"):
     """Load model with optimizations and max batch size control"""
-    global tts, current_backbone, current_codec, model_loaded, using_lmdeploy
+    global tts, current_backbone, current_codec, current_adapter, model_loaded, using_lmdeploy
     lmdeploy_error_reason = None
     model_loaded = False # Ensure we don't try to use a half-loaded model
+    current_adapter = adapter_choice or "Không"
     
     # Helper for slot updates (initially no change)
     slot_no_updates = [gr.update()] * MAX_SPEAKERS
@@ -367,9 +383,45 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                     "description": f"Custom Model: {custom_model_id}"
                 }
         else:
-            backbone_config = BACKBONE_CONFIGS[backbone_choice]
+            backbone_config = dict(BACKBONE_CONFIGS[backbone_choice])
             
-        codec_config = CODEC_CONFIGS[codec_choice]
+        codec_config = dict(CODEC_CONFIGS[codec_choice])
+
+        # Portable Model Manager: ensure model & codec are checked/downloaded into model/
+        from vieneu_utils.model_manager import ensure_model
+        
+        target_bb = backbone_config["repo"]
+        is_local_bb = os.path.isabs(target_bb) or os.path.exists(target_bb) or os.path.exists(os.path.join(_PROJECT_DIR, target_bb))
+        if not is_local_bb:
+            yield (
+                f"🔍 Đang kiểm tra / cập nhật model '{target_bb}' trên Hugging Face vào thư mục model/...",
+                gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False),
+                gr.update(), gr.update(), gr.update(), *slot_no_updates
+            )
+            backbone_config["repo"] = str(ensure_model(
+                target_bb, category="backbone", check_update=True, hf_token=custom_hf_token
+            ))
+        else:
+            backbone_config["repo"] = str(ensure_model(
+                target_bb, category="backbone", check_update=False, hf_token=custom_hf_token
+            ))
+
+        target_cc = codec_config.get("repo", "")
+        if target_cc:
+            is_local_cc = os.path.isabs(target_cc) or os.path.exists(target_cc) or os.path.exists(os.path.join(_PROJECT_DIR, target_cc))
+            if not is_local_cc:
+                codec_config["repo"] = str(ensure_model(
+                    target_cc, category="codec", check_update=True, hf_token=custom_hf_token
+                ))
+
+        # For v3-Turbo, ensure MOSS Audio Tokenizer is checked/updated in model/codec/
+        if "v3" in backbone_choice.lower() and "nano" not in backbone_choice.lower():
+            ensure_model(
+                "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano",
+                category="codec",
+                check_update=True,
+                hf_token=custom_hf_token
+            )
         use_lmdeploy = False
         
         # Override LMDeploy if custom
@@ -621,12 +673,19 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                 # auto-selected from the device inside Vieneu(mode="v3turbo"); ONNX
                 # graphs are fetched from the model repo's onnx/ subfolder.
                 print("   🆕 Mode: v3 Turbo (CPU=ONNX / GPU=PyTorch)")
-                # Map the app's device string to what the v3 engine understands.
                 v3_device = "cpu" if str(backbone_device).lower() == "cpu" else "auto"
-                # precision: "int8" (mặc định, subfolder onnx_int8) | "fp32" (onnx_update).
-                # Chỉ ảnh hưởng đường CPU/ONNX; trên GPU dùng PyTorch nên bỏ qua.
-                v3_precision = backbone_config.get("precision", "int8")
-                print(f"   🎚️  Precision: {v3_precision}")
+                v3_precision = backbone_config.get("precision", "fp32")
+                if v3_device == "cpu":
+                    act_precision = f"{v3_precision.upper()} (ONNX)"
+                else:
+                    import torch
+                    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                        act_precision = "bfloat16 (CUDA)"
+                    elif torch.cuda.is_available():
+                        act_precision = "float16 (CUDA)"
+                    else:
+                        act_precision = "float32 (PyTorch)"
+                print(f"   🎚️  Precision: {act_precision}")
                 tts = Vieneu(
                     mode="v3turbo",
                     backbone_repo=backbone_config["repo"],
@@ -634,6 +693,42 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                     precision=v3_precision,
                     hf_token=custom_hf_token,
                 )
+                if hasattr(tts, "engine") and hasattr(tts.engine, "model"):
+                    tts._raw_base_model = tts.engine.model
+                    tts._orig_preset_voices = dict(getattr(tts, "_preset_voices", {}))
+                    tts._orig_default_voice = getattr(tts, "_default_voice", None)
+
+                    if current_adapter and current_adapter != "Không":
+                        adapter_path = Path(_PROJECT_DIR) / "finetune" / "output" / current_adapter / "adapter"
+                        if adapter_path.is_dir():
+                            if v3_device == "cpu":
+                                print(f"⚠️ Adapter LoRA ({current_adapter}) yêu cầu GPU PyTorch. Bỏ qua nạp trên CPU ONNX.")
+                            else:
+                                try:
+                                    from vieneu_lora.lora import load_adapter
+                                    print(f"   🎛️ Nạp LoRA adapter: {current_adapter} từ {adapter_path}...")
+                                    tts.engine.model = load_adapter(tts._raw_base_model, str(adapter_path))
+                                    if hasattr(tts.engine, "_step_graphs"):
+                                        tts.engine._step_graphs.clear()
+                                    preset_json = adapter_path / "voices_v3_turbo.json"
+                                    if preset_json.is_file():
+                                        import json
+                                        p_data = json.loads(preset_json.read_text(encoding="utf-8"))
+                                        for v_name, v_val in p_data.get("presets", {}).items():
+                                            emb = v_val.get("speaker_emb")
+                                            codes = v_val.get("codes")
+                                            tts._preset_voices[v_name] = {
+                                                "description": v_val.get("description", f"Adapter {current_adapter}"),
+                                                "gender": v_val.get("gender", ""),
+                                                "style": v_val.get("style", "normal"),
+                                                "speaker_emb": np.asarray(emb, dtype=np.float32) if emb is not None else None,
+                                                "codes": np.asarray(codes, dtype=np.int64) if codes is not None else None,
+                                            }
+                                        if p_data.get("default_voice"):
+                                            tts._default_voice = p_data["default_voice"]
+                                    print(f"   ✅ Đã kích hoạt LoRA adapter '{current_adapter}'!")
+                                except Exception as e:
+                                    print(f"   ❌ Lỗi nạp LoRA adapter: {e}")
             elif "v2-Turbo" in backbone_choice:
                 # VieNeu v2 Turbo uses the dedicated backend
                 print("   ⚡ Mode: Turbo")
@@ -862,6 +957,108 @@ def resolve_voice_id(v_id: str) -> str:
             
     return v_id
 
+
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".vieneu_settings.json")
+
+
+def get_saved_seed() -> int:
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return int(data.get("saved_seed", -1))
+    except Exception:
+        pass
+    return -1
+
+
+def save_seed_to_disk(val: int):
+    try:
+        data = {}
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        data["saved_seed"] = int(val)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving seed to disk: {e}")
+
+
+def resolve_voice_display_name(voice_choice: str, mode_tab: str = "") -> str:
+    if mode_tab == "custom_mode":
+        return "Voice Cloning"
+    global PRESET_VOICES_CACHE
+    v_id = resolve_voice_id(str(voice_choice or ""))
+    name = str(voice_choice or "")
+    if PRESET_VOICES_CACHE:
+        for item in PRESET_VOICES_CACHE:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                label, val = str(item[0]), str(item[1])
+                if v_id == val or voice_choice == label or voice_choice == val:
+                    clean_label = label.split(" — ")[0].strip().split(" (")[0].strip()
+                    if val and not val.startswith("BV") and "_" not in val:
+                        return val
+                    return clean_label or val or label
+            elif isinstance(item, str):
+                if v_id == item or voice_choice == item:
+                    return item.split(" — ")[0].strip().split(" (")[0].strip()
+    target = v_id or name
+    if " — " in target:
+        target = target.split(" — ")[0].strip()
+    if " (" in target:
+        target = target.split(" (")[0].strip()
+    return target or "Mặc định"
+
+
+def render_audio_stats_html(
+    out_audio_path: str,
+    voice_choice: str,
+    mode_tab: str,
+    actual_seed: int,
+    process_time: float,
+    speed: float = 1.0,
+    sr: int = 24000,
+    model_label: str = ""
+) -> str:
+    duration = 0.0
+    file_size_kb = 0.0
+    channels_str = "Mono"
+    subtype_str = "16-bit PCM"
+    if out_audio_path and os.path.exists(out_audio_path):
+        try:
+            file_size_kb = os.path.getsize(out_audio_path) / 1024.0
+            info = sf.info(out_audio_path)
+            duration = info.duration
+            sr = info.samplerate
+            channels_str = "Mono" if info.channels == 1 else "Stereo"
+        except Exception:
+            pass
+
+    v_name = resolve_voice_display_name(voice_choice, mode_tab)
+    voice_html = f"<span class='stats-badge'>{v_name}</span>"
+
+    rtf_info = f" ({duration / process_time:.2f}x realtime)" if process_time > 0.05 and duration > 0 else ""
+
+    html = f"""<div class="audio-stats-card">
+    <div class="stats-header">✅ Tạo giọng đọc thành công!</div>
+    <div class="stats-title">📊 Thông Số Âm Thanh Tạo Ra:</div>
+    <ul class="stats-list">
+        <li><strong>Giọng đọc:</strong> {voice_html}</li>
+        <li><strong>Thời lượng:</strong> {duration:.2f} giây</li>
+        <li><strong>Tần số lấy mẫu:</strong> {sr:,} Hz ({channels_str} {subtype_str})</li>
+        <li><strong>Dung lượng file:</strong> {file_size_kb:.1f} KB</li>
+        <li><strong>Tốc độ áp dụng:</strong> {speed:.2f}x | <strong>Âm lượng:</strong> 1.0x</li>
+        <li><strong>Thời gian xử lý API:</strong> {process_time:.2f}s{rtf_info}</li>
+        <li><strong>Seed:</strong> <span class="stats-seed">{actual_seed}</span> <button type="button" class="inline-use-btn" onclick="window.useSeed('{actual_seed}')">Use</button></li>
+    </ul>
+</div>"""
+    return html
+
+
 # --- 2. DATA & HELPERS ---
 
 # Phong cách đọc (style) đã bỏ trên v3 Turbo: style nằm sẵn trong reference
@@ -871,6 +1068,10 @@ def resolve_voice_id(v_id: str) -> str:
 def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: str,
                       mode_tab: str, generation_mode: str, use_batch: bool, max_batch_size_run: int,
                       temperature: float, max_chars_chunk: int,
+                      speed: float = 1.0,
+                      seed: int = -1,
+                      top_p: float = 0.95, top_k: int = 25,
+                      repetition_penalty: float = 1.2, max_new_frames: int = 300,
                       denoise_ref: bool = True, session_id: str = None):
     """Synthesis with optimization support and max batch size control"""
     global tts, current_backbone, current_codec, model_loaded, using_lmdeploy
@@ -886,6 +1087,32 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
         return
     
     raw_text = text.strip()
+
+    # Quản lý Seed (nếu < 0 thì random, >= 0 thì cố định)
+    import random
+    try:
+        seed_val = int(seed)
+    except Exception:
+        seed_val = -1
+
+    if seed_val < 0:
+        actual_seed = random.randint(1, 2147483647)
+    else:
+        actual_seed = seed_val
+
+    try:
+        import torch
+        torch.manual_seed(actual_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(actual_seed)
+    except Exception:
+        pass
+
+    # Reset cache CUDA graph của engine để đảm bảo seed có hiệu lực 100%
+    if hasattr(tts, "engine") and getattr(tts.engine, "_step_graphs", None) is not None:
+        tts.engine._step_graphs = {}
+        if hasattr(tts.engine, "_graphed_frames"):
+            tts.engine._graphed_frames = {}
     
     codec_config = CODEC_CONFIGS[current_codec]
     use_preencoded = codec_config['use_preencoded']
@@ -997,7 +1224,12 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                                  "ref_codes": ref_codes if has_ref else None,
                                  "use_ref_codes": has_ref} for j in idxs]
                         for j, w in zip(idxs, tts._v3_batch_engine.generate_batch(
-                                reqs, temperature=temperature, max_new_frames=300)):
+                                reqs,
+                                temperature=float(temperature),
+                                top_k=int(top_k),
+                                top_p=float(top_p),
+                                repetition_penalty=float(repetition_penalty),
+                                max_new_frames=int(max_new_frames))):
                             v3_wavs[j] = w
                     wav = join_audio_chunks(v3_wavs, sr=sr_v3, silence_ps=gaps_to_silence(v3_gaps))
                 else:
@@ -1013,17 +1245,29 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                     chunk_durations = []
                     last_t = time.time()
                     has_ref = bool(ref_codes is not None and len(ref_codes) > 0)
+                    is_nano = "nano" in (current_backbone or "").lower()
                     for i, chunk in enumerate(v3_chunks):
                         if _STOP_EVENT.is_set():
                             yield None, "⏹️ Đã dừng tạo giọng nói."
                             return
                         yield None, f"⏳ {v3_label}: Đang xử lý đoạn {i + 1}/{total_v3}..."
                         ph = phonemize_text_with_emotions(chunk)
-                        chunk_wav = tts.engine.infer(
-                            phonemes=ph, speaker_emb=v3_speaker_emb,
-                            ref_codes=ref_codes if has_ref else None,
-                            use_ref_codes=has_ref,
-                            temperature=temperature, max_new_frames=300)
+                        if is_nano:
+                            chunk_wav = tts.engine.infer(
+                                phonemes=ph, speaker_emb=v3_speaker_emb,
+                                ref_codes=ref_codes if has_ref else None,
+                                speed=float(speed),
+                                seed=actual_seed)
+                        else:
+                            chunk_wav = tts.engine.infer(
+                                phonemes=ph, speaker_emb=v3_speaker_emb,
+                                ref_codes=ref_codes if has_ref else None,
+                                use_ref_codes=has_ref,
+                                temperature=float(temperature),
+                                top_k=int(top_k),
+                                top_p=float(top_p),
+                                repetition_penalty=float(repetition_penalty),
+                                max_new_frames=int(max_new_frames))
                         now = time.time()
                         chunk_durations.append(now - last_t)
                         last_t = now
@@ -1041,6 +1285,10 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                                 f"đang xử lý đoạn {done + 1}/{total_v3}"
                             )
                     wav = join_audio_chunks(v3_wavs, sr=sr_v3, silence_ps=gaps_to_silence(v3_gaps))
+
+                # Hậu kỳ chất lượng cao bằng Rubber Band (formant-preserved) cho v3 Turbo
+                if not is_nano and abs(float(speed) - 1.0) > 0.01 and wav is not None and len(wav) > 0:
+                    wav = time_stretch_audio(wav, sr_v3, float(speed))
             except Exception as e:
                 yield None, f"❌ Lỗi tổng hợp ({v3_label}): {str(e)}"
                 return
@@ -1051,8 +1299,17 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                 sf.write(tmp.name, wav, sr_v3)
                 out_path_v3 = tmp.name
             _dt = time.time() - _t0
-            _spd = f", Tốc độ: {len(wav)/sr_v3/_dt:.2f}x realtime" if _dt > 0 else ""
-            yield out_path_v3, f"✅ Hoàn tất! ({v3_label}, Thời gian: {_dt:.2f}s{_spd})"
+            stats_card = render_audio_stats_html(
+                out_audio_path=out_path_v3,
+                voice_choice=voice_choice,
+                mode_tab=mode_tab,
+                actual_seed=actual_seed,
+                process_time=_dt,
+                speed=float(speed),
+                sr=sr_v3,
+                model_label=v3_label
+            )
+            yield out_path_v3, stats_card
             cleanup_gpu_memory()
             return
         # ========================== end v3 TURBO BRANCH ======================
@@ -1190,17 +1447,25 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
             # Default silence=0.15s to match SDK
             silence_p = 0.15 if not is_v2_turbo else 0.0 # Turbo adds silence internally
             final_wav = join_audio_chunks(all_wavs, sr=sr, silence_p=silence_p)
+            if abs(float(speed) - 1.0) > 0.01 and final_wav is not None and len(final_wav) > 0:
+                final_wav = time_stretch_audio(final_wav, sr, float(speed))
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 sf.write(tmp.name, final_wav, sr)
                 output_path = tmp.name
             
             process_time = time.time() - start_time
-            backend_info = f" (Backend: {'LMDeploy 🚀' if using_lmdeploy else 'Standard 📦'})"
-            speed_info = f", Tốc độ: {len(final_wav)/sr/process_time:.2f}x realtime" if process_time > 0 else ""
-            
-            
-            yield output_path, f"✅ Hoàn tất! (Thời gian: {process_time:.2f}s{speed_info}){backend_info}"
+            stats_card = render_audio_stats_html(
+                out_audio_path=output_path,
+                voice_choice=voice_choice,
+                mode_tab=mode_tab,
+                actual_seed=actual_seed,
+                process_time=process_time,
+                speed=float(speed),
+                sr=sr,
+                model_label='LMDeploy 🚀' if using_lmdeploy else 'Standard 📦'
+            )
+            yield output_path, stats_card
             
             # Cleanup memory
             if using_lmdeploy and hasattr(tts, 'cleanup_memory'):
@@ -1230,6 +1495,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
     
     # === STREAMING MODE ===
     else:
+        start_time = time.time()
         sr = 24000
         crossfade_samples = int(sr * 0.03)
         audio_queue = queue.Queue(maxsize=100)
@@ -1372,8 +1638,19 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
             final_wav = np.concatenate(full_audio_buffer)
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 sf.write(tmp.name, final_wav, sr)
-                
-                yield tmp.name, f"✅ Hoàn tất Streaming! ({backend_info})"
+                out_stream_path = tmp.name
+            
+            stats_card = render_audio_stats_html(
+                out_audio_path=out_stream_path,
+                voice_choice=voice_choice,
+                mode_tab=mode_tab,
+                actual_seed=actual_seed,
+                process_time=time.time() - start_time,
+                speed=float(speed),
+                sr=sr,
+                model_label=backend_info
+            )
+            yield out_stream_path, stats_card
             
             # Cleanup memory
             if using_lmdeploy and hasattr(tts, 'cleanup_memory'):
@@ -1882,15 +2159,24 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 backbone_select = gr.Dropdown(
                     list(BACKBONE_CONFIGS.keys()) + ["Custom Model"],
                     value=default_backbone,
-                    label="🦜 Backbone"
+                    label="🦜 Backbone",
+                    scale=3
+                )
+                adapter_select = gr.Dropdown(
+                    choices=scan_available_adapters(),
+                    value="Không",
+                    label="🧩 LoRA Adapter",
+                    #info="finetune/output/*/adapter",
+                    scale=2
                 )
                 codec_select = gr.Dropdown(
                     list(CODEC_CONFIGS.keys()), 
                     value=default_codec, 
                     label="🎵 Codec",
-                    interactive=False
+                    interactive=False,
+                    scale=2
                 )
-                device_choice = gr.Radio(get_available_devices(), value="Auto", label="🖥️ Device")
+                device_choice = gr.Radio(get_available_devices(), value="Auto", label="🖥️ Device", scale=1)
             
             with gr.Row(visible=False) as custom_model_group:
                 custom_backbone_model_id = gr.Textbox(
@@ -1961,7 +2247,9 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 "(chèn trực tiếp vào văn bản) — riêng tính năng này vẫn **đang thử nghiệm**."
             )
 
-            btn_load = gr.Button("🔄 Tải Model", variant="primary")
+            with gr.Row():
+                btn_load = gr.Button("🔄 Tải Model", variant="primary", scale=4)
+                btn_refresh_adapters = gr.Button("🔄 Quét lại Adapter", variant="secondary", scale=1)
             model_status = gr.Markdown("⏳ Chưa tải model.")
         
         with gr.Row(elem_classes="container"):
@@ -2189,23 +2477,65 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                         maximum=64,
                         value=default_batch_size,
                         step=1,
-                        label="📊 Batch Size (Generation)",
+                        label="📊 Batch Size",
                         info="Số lượng đoạn văn bản xử lý cùng lúc. Giá trị cao = nhanh hơn nhưng tốn VRAM hơn. Giảm xuống nếu gặp lỗi Out of Memory."
                     )
                 
                 with gr.Accordion("⚙️ Cài đặt nâng cao (Generation)", open=False):
                     with gr.Row():
+                        speed_slider = gr.Slider(
+                            minimum=0.5, maximum=2.0, value=1.0, step=0.05,
+                            label="⚡ Tốc độ đọc",
+                            info="v3 Nano dùng native AI; v3 Turbo dùng xử lý hậu kỳ."
+                        )
                         temperature_slider = gr.Slider(
-                            minimum=0.1, maximum=1.5, value=default_temp, step=0.1,
+                            minimum=0.1, maximum=1.5, value=default_temp, step=0.05,
                             label="🌡️ Temperature", 
                             info="Độ sáng tạo. Cao = đa dạng cảm xúc hơn nhưng dễ lỗi. Thấp = ổn định hơn."
                         )
-                        max_chars_chunk_slider = gr.Slider(
-                            minimum=128, maximum=512,
-                            value=256, step=32,
-                            label="📝 Max Chars per Chunk",
-                            info="Độ dài tối đa mỗi đoạn xử lý (mặc định: 256)."
-                        )
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            with gr.Row(elem_classes="seed-control-row"):
+                                seed_input = gr.Number(
+                                    value=get_saved_seed(), precision=0,
+                                    label="🎲 Seed",
+                                    info="-1 = Ngẫu nhiên. Cùng một seed giọng đọc giống nhau 100%.",
+                                    elem_id="seed_input_box",
+                                    elem_classes=["no-spinner-input"],
+                                    scale=5,
+                                )
+                                btn_reset_seed = gr.Button("✕", elem_id="btn_reset_seed", elem_classes=["seed-clear-btn"])
+                                btn_save_seed = gr.Button("💾 Lưu", size="sm", elem_id="btn_save_seed", elem_classes=["seed-save-btn"], min_width=48)
+                        with gr.Column(scale=1):
+                            max_chars_chunk_slider = gr.Slider(
+                                minimum=64, maximum=512,
+                                value=256, step=32,
+                                label="📝 Max Chars per Chunk",
+                                info="Độ dài tối đa mỗi đoạn xử lý (mặc định: 256)."
+                            )
+                    with gr.Column(visible="v3" in (default_backbone or "").lower()) as v3_advanced_group:
+                        with gr.Row():
+                            top_p_slider = gr.Slider(
+                                minimum=0.1, maximum=1.0, value=0.95, step=0.05,
+                                label="🎯 Top P (v3)",
+                                info="Lấy mẫu nhân xác suất (nucleus sampling, mặc định: 0.95)."
+                            )
+                            top_k_slider = gr.Slider(
+                                minimum=1, maximum=100, value=25, step=1,
+                                label="🔢 Top K (v3)",
+                                info="Giới hạn số token khả dĩ nhất (mặc định: 25)."
+                            )
+                        with gr.Row():
+                            repetition_penalty_slider = gr.Slider(
+                                minimum=1.0, maximum=2.0, value=1.2, step=0.05,
+                                label="🔁 Repetition Penalty (v3)",
+                                info="Phạt lặp từ/âm (mặc định: 1.2, cao hơn = chống lặp âm)."
+                            )
+                            max_new_frames_slider = gr.Slider(
+                                minimum=50, maximum=1200, value=300, step=25,
+                                label="⏱️ Max New Frames (v3)",
+                                info="Số frame âm thanh tối đa cho mỗi đoạn (mặc định: 300 ~ 24s)."
+                            )
                 
                 # synthesize_speech(mode_tab=...): the story tab always reads a preset,
                 # the Voice Cloning tab always clones from the uploaded sample.
@@ -2223,13 +2553,15 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     autoplay=True
                 )
                 with gr.Group():
-                    status_output = gr.Textbox(
-                        label="Trạng thái", 
+                    status_output = gr.HTML(
+                        value="<div class='status-live-msg'>Sẵn sàng</div>",
+                        label="Trạng thái",
+                        show_label=True,
+                        container=True,
                         elem_classes="status-box",
-                        lines=2,
-                        max_lines=10,
-                        show_copy_button=True
                     )
+                seed_cache_box = gr.Textbox(value="-1", elem_id="seed_cache_box", elem_classes=["hidden-bridge"])
+                btn_hidden_use_seed = gr.Button("Use", elem_id="btn_hidden_use_seed", elem_classes=["hidden-bridge"])
                 with gr.Group():
                     estimate_output = gr.Textbox(
                         label="Ước tính thời gian",
@@ -2328,6 +2660,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 gr.update(visible=not is_v2_gpu),  # v3_ref_examples_group — audio-only examples
                 clone_info_update,             # clone_info_md
                 gr.update(value=256),  # max_chars_chunk_slider
+                gr.update(visible=is_v3),  # v3_advanced_group (top_p, top_k, rep_penalty, max_new_frames)
             )
 
         backbone_select.change(
@@ -2347,6 +2680,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 v3_ref_examples_group,
                 clone_info_md,
                 max_chars_chunk_slider,
+                v3_advanced_group,
             ]
         )
         
@@ -2359,11 +2693,17 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         load_event = btn_load.click(
             fn=load_model,
             inputs=[backbone_select, codec_select, device_choice, use_lmdeploy_cb,
-                    custom_backbone_model_id, custom_backbone_base_model, custom_backbone_hf_token],
+                    custom_backbone_model_id, custom_backbone_base_model, custom_backbone_hf_token,
+                    adapter_select],
             outputs=[model_status, btn_generate, btn_generate_conv, btn_load, btn_stop, voice_select,
                      tab_custom,
                      conv_tab,
                      *speaker_voice_dds]
+        )
+
+        btn_refresh_adapters.click(
+            fn=lambda: gr.update(choices=scan_available_adapters()),
+            outputs=adapter_select
         )
 
         # --- Voice Cloning tab: generate button + saved-voice list follow the model state ---
@@ -2449,6 +2789,9 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             inputs=[text_input, voice_select, custom_audio, custom_text, current_mode_state,
                     generation_mode, use_batch, max_batch_size_run,
                     temperature_slider, max_chars_chunk_slider,
+                    speed_slider,
+                    seed_input,
+                    top_p_slider, top_k_slider, repetition_penalty_slider, max_new_frames_slider,
                     denoise_checkbox, session_id_state],
             outputs=[audio_output, status_output, estimate_output]
         )
@@ -2462,12 +2805,42 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             inputs=[clone_text_input, voice_select, custom_audio, custom_text, clone_mode_state,
                     generation_mode, use_batch, max_batch_size_run,
                     temperature_slider, max_chars_chunk_slider,
+                    speed_slider,
+                    seed_input,
+                    top_p_slider, top_k_slider, repetition_penalty_slider, max_new_frames_slider,
                     denoise_checkbox, session_id_state],
             outputs=[audio_output, status_output, estimate_output]
         )
         btn_generate_clone.click(lambda: gr.update(visible=False), outputs=[download_btn])
         btn_generate_clone.click(lambda: gr.update(interactive=True), outputs=btn_stop)
         clone_gen_event.then(lambda: gr.update(interactive=False), outputs=btn_stop)
+
+        # --- Seed Control Handlers ---
+        def on_reset_seed():
+            save_seed_to_disk(-1)
+            gr.Info("🔄 Đã đặt lại Seed về -1 (Ngẫu nhiên)")
+            return -1
+
+        def on_save_seed(val):
+            try:
+                s = int(val)
+            except Exception:
+                s = -1
+            save_seed_to_disk(s)
+            gr.Info(f"💾 Đã lưu Seed vĩnh viễn: {s}")
+            return s
+
+        def on_use_seed(val):
+            try:
+                s = int(val)
+            except Exception:
+                s = -1
+            gr.Info(f"🎲 Đã chọn Seed: {s} (tạm thời)")
+            return s
+
+        btn_reset_seed.click(fn=on_reset_seed, outputs=[seed_input])
+        btn_save_seed.click(fn=on_save_seed, inputs=[seed_input], outputs=[seed_input])
+        btn_hidden_use_seed.click(fn=on_use_seed, inputs=[seed_cache_box], outputs=[seed_input])
 
         # --- Save / delete a cloned voice as a preset ---
         def _refresh_voice_caches():
@@ -2530,6 +2903,79 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             fn=_delete_voice,
             inputs=[user_voice_dd],
             outputs=[clone_save_status, user_voice_dd, voice_select, srt_voice, *speaker_voice_dds],
+        )
+
+        # --- LoRA Adapter hot-swap handler ---
+        def on_adapter_change(adapter_choice):
+            global tts, current_adapter, model_loaded
+            current_adapter = adapter_choice or "Không"
+            no_change = [gr.update(), *([gr.update()] * (2 + MAX_SPEAKERS))]
+            if not model_loaded or tts is None:
+                return no_change
+
+            if not hasattr(tts, "engine") or not hasattr(tts.engine, "model"):
+                return no_change
+
+            raw_model = getattr(tts, "_raw_base_model", None)
+            if raw_model is None:
+                raw_model = getattr(tts.engine.model, "get_base_model", lambda: tts.engine.model)()
+                tts._raw_base_model = raw_model
+
+            if not hasattr(tts, "_orig_preset_voices"):
+                tts._orig_preset_voices = dict(getattr(tts, "_preset_voices", {}))
+                tts._orig_default_voice = getattr(tts, "_default_voice", None)
+
+            if adapter_choice == "Không":
+                tts.engine.model = raw_model
+                if hasattr(tts.engine, "_step_graphs"):
+                    tts.engine._step_graphs.clear()
+                tts._preset_voices = dict(tts._orig_preset_voices)
+                tts._default_voice = tts._orig_default_voice
+                print("🔄 Đã tắt LoRA adapter, khôi phục base model.")
+            else:
+                adapter_path = Path(_PROJECT_DIR) / "finetune" / "output" / adapter_choice / "adapter"
+                if not adapter_path.is_dir():
+                    print(f"❌ Không tìm thấy thư mục adapter: {adapter_path}")
+                    return no_change
+
+                try:
+                    from vieneu_lora.lora import load_adapter
+                    print(f"🔄 Đang nạp LoRA adapter động: {adapter_choice}...")
+                    tts.engine.model = load_adapter(raw_model, str(adapter_path))
+                    if hasattr(tts.engine, "_step_graphs"):
+                        tts.engine._step_graphs.clear()
+
+                    tts._preset_voices = dict(tts._orig_preset_voices)
+                    preset_json = adapter_path / "voices_v3_turbo.json"
+                    if preset_json.is_file():
+                        import json
+                        p_data = json.loads(preset_json.read_text(encoding="utf-8"))
+                        for v_name, v_val in p_data.get("presets", {}).items():
+                            emb = v_val.get("speaker_emb")
+                            codes = v_val.get("codes")
+                            tts._preset_voices[v_name] = {
+                                "description": v_val.get("description", f"Adapter {adapter_choice}"),
+                                "gender": v_val.get("gender", ""),
+                                "style": v_val.get("style", "normal"),
+                                "speaker_emb": np.asarray(emb, dtype=np.float32) if emb is not None else None,
+                                "codes": np.asarray(codes, dtype=np.int64) if codes is not None else None,
+                            }
+                        if p_data.get("default_voice"):
+                            tts._default_voice = p_data["default_voice"]
+                    print(f"✅ Đã nạp thành công LoRA adapter: {adapter_choice}")
+                except Exception as e:
+                    print(f"❌ Lỗi nạp LoRA adapter: {e}")
+                    return no_change
+
+            _refresh_voice_caches()
+            default_v = getattr(tts, "_default_voice", None)
+            status_msg = get_model_status_message()
+            return [status_msg, *_voice_list_updates(select_voice=default_v)]
+
+        adapter_select.change(
+            fn=on_adapter_change,
+            inputs=[adapter_select],
+            outputs=[model_status, voice_select, srt_voice, *speaker_voice_dds]
         )
 
         # --- Stop Button ---

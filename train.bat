@@ -1,3 +1,3 @@
-uv run python finetune/prepare_dataset.py --dataset-dir finetune/dataset/HoatNgon2h --speaker hoat_ngon --out finetune/dataset/train.parquet
+uv run python finetune/prepare_dataset.py --dataset-dir finetune/dataset/NhoNgotNgao2h --speaker ngot_ngao --out finetune/dataset/ngot_ngao.parquet
 uv run python finetune/train_lora.py --data finetune/dataset/train.parquet --run hoat_ngon --target all --r 32 --alpha 64 --grad-checkpoint --text-loss-weight 2.0 --epochs 3 --merge
 uv run python finetune/make_voice.py --audio E:\VieTTS\vinu\finetune\dataset\HoatNgon2h\audio_0001.wav --name "Hoạt Ngôn" --out finetune/output/hoat_ngon/merged

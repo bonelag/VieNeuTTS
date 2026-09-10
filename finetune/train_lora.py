@@ -20,6 +20,11 @@ import sys
 import time
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -69,9 +74,83 @@ def parse_args():
     ap.add_argument("--eval-every", type=int, default=100)
     ap.add_argument("--save-every", type=int, default=200)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--voice-name", default="", help="custom display name for the auto-generated voice preset")
     ap.add_argument("--merge", action="store_true", help="also write the merged full model at the end")
     ap.add_argument("--num-workers", type=int, default=2)
     return ap.parse_args()
+
+
+def build_optimal_voice_presets(rows, out_dir: Path, voice_name_override: str = "", no_ref: bool = False):
+    """Auto-generate optimal voices_v3_turbo.json by selecting the most representative clip for each speaker."""
+    by_speaker = {}
+    for r in rows:
+        spk = r.get("speaker", "default")
+        by_speaker.setdefault(spk, []).append(r)
+
+    presets = {}
+    default_voice = None
+
+    for spk, spk_rows in by_speaker.items():
+        disp_name = voice_name_override.strip() if (voice_name_override.strip() and len(by_speaker) == 1) else spk.replace("_", " ").title()
+        if not default_voice:
+            default_voice = disp_name
+
+        embs = [np.asarray(r["speaker_embedding"], dtype=np.float32) for r in spk_rows if "speaker_embedding" in r and r["speaker_embedding"]]
+        if not embs:
+            continue
+        all_embs = np.stack(embs)
+        centroid = np.mean(all_embs, axis=0)
+        c_norm = np.linalg.norm(centroid)
+
+        norms = np.linalg.norm(all_embs, axis=1) * c_norm
+        norms[norms == 0] = 1e-9
+        sims = (all_embs @ centroid) / norms
+
+        best_score = -1e9
+        best_row = spk_rows[0]
+        best_sim = 0.0
+
+        for i, r in enumerate(spk_rows):
+            dur = float(r.get("duration", 0))
+            dur_score = 1.0 - min(abs(dur - 5.0) / 5.0, 1.0)
+            in_range_bonus = 0.5 if (3.5 <= dur <= 6.5) else (0.2 if (2.5 <= dur <= 8.0) else -0.5)
+            score = sims[i] * 0.5 + dur_score * 0.3 + in_range_bonus
+
+            if score > best_score:
+                best_score = score
+                best_row = r
+                best_sim = float(sims[i])
+
+        ref_codes = None
+        if not no_ref and "codes" in best_row and best_row["codes"]:
+            codes = best_row["codes"]
+            if len(codes) > 65:
+                codes = codes[:65]
+            ref_codes = [[int(x) for x in row] for row in codes]
+
+        speaker_emb = [round(float(x), 6) for x in centroid]
+
+        presets[disp_name] = {
+            "description": f"Auto-generated preset for {disp_name}",
+            "gender": "",
+            "speaker_emb": speaker_emb,
+            "codes": ref_codes,
+        }
+        print(f"🎯 Auto-selected optimal reference for '{disp_name}': {best_row.get('file_name', 'clip')} (dur: {best_row.get('duration', 0):.2f}s, sim: {best_sim:.3f})")
+
+    if not presets:
+        return None
+
+    data = {
+        "presets": presets,
+        "default_voice": default_voice
+    }
+
+    adapter_json = out_dir / "adapter" / "voices_v3_turbo.json"
+    adapter_json.parent.mkdir(parents=True, exist_ok=True)
+    adapter_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"📄 Optimal voice preset written to {adapter_json}")
+    return data
 
 
 @torch.no_grad()
@@ -184,6 +263,7 @@ def main() -> None:
                 break
 
     save_adapter(peft_model, out_dir / "adapter", tokenizer)
+    preset_data = build_optimal_voice_presets(rows, out_dir, voice_name_override=args.voice_name, no_ref=args.no_ref)
     if eval_loader:
         le, ae = evaluate(model, eval_loader, device, autocast, args)
         print(f"[eval] final  loss {le:.4f}  acc_cb0 {ae:.3f}")
@@ -191,7 +271,12 @@ def main() -> None:
     if args.merge:
         merged = merge_lora_into(peft_model)
         export_merged(merged, tokenizer, args.base, out_dir / "merged", subfolder=args.subfolder)
+        if preset_data:
+            merged_json = out_dir / "merged" / "voices_v3_turbo.json"
+            merged_json.write_text(json.dumps(preset_data, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"merged model written to {out_dir / 'merged'}")
+    else:
+        print("ℹ️ Hoàn tất lưu LoRA adapter. Không merge model vì không có cờ --merge.")
 
 
 if __name__ == "__main__":

@@ -90,7 +90,11 @@ def wrap_with_estimate(synthesize_fn):
                             f"Tổng: {_format_duration(estimated_total)}"
                         )
 
-            yield audio_path, status_text, estimate_text
+            formatted_status = status_text
+            if isinstance(formatted_status, str) and formatted_status and not formatted_status.strip().startswith("<div"):
+                formatted_status = f"<div class='status-live-msg'>{formatted_status}</div>"
+
+            yield audio_path, formatted_status, estimate_text
     return wrapper
 
 def cleanup_gpu_memory():

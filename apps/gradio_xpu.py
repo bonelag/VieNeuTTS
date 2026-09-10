@@ -727,7 +727,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS (XPU)", head=head_html) a
                         maximum=256, 
                         value=128, 
                         step=1, 
-                        label="📊 Batch Size (Generation)",
+                        label="📊 Batch Size",
                         info="Số lượng đoạn văn bản xử lý cùng lúc. Càng lớn thì xử lý càng nhanh. Thông thường 128 chunks với 64 chars hết 7gb vram."
                     )
                 

@@ -83,9 +83,34 @@ class OnnxV3LiteEngine:
         self._lock = threading.RLock()
         self.device = _Dev()
         self.checkpoint_path = checkpoint_path
-        repo = onnx_repo or checkpoint_path
+        p_check = Path(checkpoint_path)
+        if p_check.is_dir():
+            self.checkpoint_path = str(p_check)
+            repo = str(p_check)
+            if not onnx_dir and (p_check / onnx_subfolder).is_dir():
+                onnx_dir = str(p_check / onnx_subfolder)
+        else:
+            try:
+                from vieneu_utils.model_manager import ensure_model
+                p_resolved = ensure_model(checkpoint_path, category="backbone", check_update=False)
+                if p_resolved.is_dir():
+                    self.checkpoint_path = str(p_resolved)
+                    repo = str(p_resolved)
+                    if not onnx_dir and (p_resolved / onnx_subfolder).is_dir():
+                        onnx_dir = str(p_resolved / onnx_subfolder)
+            except Exception:
+                pass
 
-        if not onnx_dir:
+        if not codec_dir:
+            try:
+                from vieneu_utils.model_manager import ensure_model
+                p_c = ensure_model(codec_repo, category="codec", check_update=False)
+                if p_c.is_dir():
+                    codec_dir = str(p_c)
+            except Exception:
+                pass
+
+        if not onnx_dir and not Path(checkpoint_path).is_dir():
             try:
                 from huggingface_hub import hf_hub_download
                 hf_hub_download(checkpoint_path, "config.json")
@@ -178,6 +203,13 @@ class OnnxV3LiteEngine:
     # ── artifact helpers ──────────────────────────────────────────────────────
     @staticmethod
     def _fetch(repo: str, files: List[str], subfolder: Optional[str]) -> Path:
+        p = Path(repo)
+        if subfolder:
+            sub = p / subfolder
+            if sub.is_dir():
+                return sub
+        if p.is_dir():
+            return p
         from huggingface_hub import hf_hub_download
         last = None
         for fn in files:

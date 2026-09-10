@@ -63,6 +63,12 @@ class VieNeuTTSv3Turbo:
         self.device = self._resolve_device(device)
         self.dtype = self._resolve_dtype(dtype)
         from transformers import AutoTokenizer, AutoModel
+        try:
+            from vieneu_utils.model_manager import ensure_model
+            checkpoint_path = str(ensure_model(checkpoint_path, category="backbone", check_update=False))
+            moss_tokenizer_path = str(ensure_model(moss_tokenizer_path, category="codec", check_update=False))
+        except Exception:
+            pass
         tok_path = tokenizer_path or checkpoint_path
         tok_sub = None if tokenizer_path else (model_subfolder or None)
         self.tokenizer = AutoTokenizer.from_pretrained(tok_path, subfolder=tok_sub or "", trust_remote_code=True)
@@ -70,7 +76,7 @@ class VieNeuTTSv3Turbo:
         # Weights live in a subfolder, so the Hub's download counter (which keys on the
         # root config.json) wouldn't register the load — touch the root file once so each
         # load counts like a normal download. Best-effort, never fatal.
-        if model_subfolder:
+        if model_subfolder and not Path(checkpoint_path).is_dir():
             try:
                 from huggingface_hub import hf_hub_download
                 hf_hub_download(checkpoint_path, "config.json")

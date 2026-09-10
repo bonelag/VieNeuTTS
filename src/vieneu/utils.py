@@ -142,6 +142,18 @@ class NeuCodecOnnx:
 
     @classmethod
     def from_pretrained(cls, repo_id: str, filename: str = "model.onnx", hf_token: Optional[str] = None):
+        p = Path(repo_id)
+        if p.is_dir() and (p / filename).is_file():
+            return cls(str(p / filename))
+        if p.is_file():
+            return cls(str(p))
+        try:
+            from vieneu_utils.model_manager import ensure_model
+            local_d = ensure_model(repo_id, category="codec", check_update=False)
+            if local_d.is_dir() and (local_d / filename).is_file():
+                return cls(str(local_d / filename))
+        except Exception:
+            pass
         from huggingface_hub import hf_hub_download
         onnx_path = hf_hub_download(
             repo_id=repo_id,

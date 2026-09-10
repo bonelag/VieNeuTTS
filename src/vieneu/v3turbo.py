@@ -26,7 +26,7 @@ from vieneu_utils.phonemize_text import (
 )
 from vieneu_utils.core_utils import (
     join_audio_chunks, gaps_to_silence, max_expected_frames, pause_pad_samples,
-    BABBLE_MAX_RETRIES,
+    BABBLE_MAX_RETRIES, time_stretch_audio,
 )
 
 
@@ -138,6 +138,13 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
                 dev_type = "cpu"
         else:
             dev_type = "cuda" if "cuda" in str(device).lower() else str(device).lower()
+        try:
+            from vieneu_utils.model_manager import ensure_model
+            backbone_repo = str(ensure_model(backbone_repo, category="backbone", check_update=False))
+            moss_tokenizer = str(ensure_model(moss_tokenizer, category="codec", check_update=False))
+        except Exception:
+            pass
+
         use_onnx = backend == "onnx" or (backend == "auto" and dev_type == "cpu")
 
         if use_onnx:
@@ -480,6 +487,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         crossfade_p: float = 0.0,
         apply_watermark: bool = True,
         batch_size: Optional[int] = None,   # GPU: trần chunk/forward (None → self.max_batch_size; 1 → tắt batch)
+        speed: float = 1.0,
         **kwargs: Any,
     ) -> np.ndarray:
         """Synthesize ``text`` into one 48 kHz waveform.
@@ -509,6 +517,8 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         final_wav = join_audio_chunks(
             all_wavs, self.sample_rate, silence_ps=gaps_to_silence(gaps)
         )
+        if abs(float(speed) - 1.0) > 0.01:
+            final_wav = time_stretch_audio(final_wav, self.sample_rate, float(speed))
         return self._apply_watermark(final_wav) if apply_watermark else final_wav
 
     def infer_stream(
@@ -581,6 +591,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         max_chars: int = 256,
         apply_watermark: bool = True,
         batch_size: Optional[int] = None,
+        speed: float = 1.0,
         **kwargs: Any,
     ) -> List[np.ndarray]:
         """Synthesize many texts, returning one waveform each (same order as ``texts``).
@@ -634,6 +645,8 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
             joined = join_audio_chunks(
                 grouped[ti], self.sample_rate, silence_ps=gaps_to_silence(per_text_gaps[ti])
             )
+            if abs(float(speed) - 1.0) > 0.01:
+                joined = time_stretch_audio(joined, self.sample_rate, float(speed))
             results.append(self._apply_watermark(joined) if apply_watermark else joined)
         return results
 

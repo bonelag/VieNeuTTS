@@ -863,3 +863,83 @@ def babble_log_line(best, tries: int, cap: int) -> str:
     what = f"chunk {best[1]} tiếng: {best[2]} cụm âm" if best[1] else "cue đứng một mình"
     return (f"babble guard: {what}, {best[3]}/{cap} frame sau {tries} lần sinh lại"
             + (" — vẫn nghi ngờ" if best[0] else ""))
+
+
+def time_stretch_audio(audio: np.ndarray, sr: int, speed: float) -> np.ndarray:
+    """Thay đổi tốc độ phát audio (speed) mà không làm đổi cao độ (pitch) hoặc méo giọng.
+
+    Đặc biệt tối ưu khi đọc chậm (speed < 1.0):
+    1. Ưu tiên sử dụng FFmpeg librubberband với tùy chọn formant=preserved:
+       - Bảo toàn formants (âm sắc thanh quản người thật), tránh hiện tượng biến giọng hay méo kim loại khi đọc chậm.
+       - Tự động dùng transients=smooth cho giọng nói con người (speech).
+    2. Nếu FFmpeg không có rubberband -> fallback sang filter atempo (WSOLA trong FFmpeg).
+    3. Nếu không có FFmpeg -> fallback sang librosa.effects.time_stretch.
+    """
+    if audio is None or len(audio) == 0:
+        return audio
+    speed = float(speed)
+    if abs(speed - 1.0) < 0.01:
+        return audio
+
+    speed = max(0.25, min(speed, 4.0))
+
+    import shutil
+    import subprocess
+    import io
+    import soundfile as sf
+
+    if shutil.which("ffmpeg"):
+        # Ưu tiên 1: librubberband (formant preserved, transients=smooth cho giọng nói)
+        try:
+            bio_in = io.BytesIO()
+            sf.write(bio_in, audio, sr, format="WAV", subtype="PCM_16")
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "wav", "-i", "pipe:0",
+                "-filter:a", f"rubberband=tempo={speed}:pitch=1.0:formant=preserved:transients=smooth",
+                "-f", "wav", "pipe:1"
+            ]
+            proc = subprocess.run(cmd, input=bio_in.getvalue(), capture_output=True, check=True)
+            bio_out = io.BytesIO(proc.stdout)
+            stretched, _ = sf.read(bio_out, dtype="float32")
+            if len(stretched) > 0:
+                return stretched
+        except Exception:
+            pass
+
+        # Ưu tiên 2: FFmpeg atempo
+        try:
+            filters = []
+            cur_speed = speed
+            while cur_speed > 2.0:
+                filters.append("atempo=2.0")
+                cur_speed /= 2.0
+            while cur_speed < 0.5:
+                filters.append("atempo=0.5")
+                cur_speed /= 0.5
+            filters.append(f"atempo={cur_speed}")
+            filter_str = ",".join(filters)
+
+            bio_in = io.BytesIO()
+            sf.write(bio_in, audio, sr, format="WAV", subtype="PCM_16")
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "wav", "-i", "pipe:0",
+                "-filter:a", filter_str,
+                "-f", "wav", "pipe:1"
+            ]
+            proc = subprocess.run(cmd, input=bio_in.getvalue(), capture_output=True, check=True)
+            bio_out = io.BytesIO(proc.stdout)
+            stretched, _ = sf.read(bio_out, dtype="float32")
+            if len(stretched) > 0:
+                return stretched
+        except Exception:
+            pass
+
+    # Fallback 3: librosa
+    try:
+        import librosa
+        return librosa.effects.time_stretch(audio, rate=speed)
+    except Exception:
+        return audio
+

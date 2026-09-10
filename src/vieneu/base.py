@@ -68,19 +68,25 @@ class BaseVieneuTTS(ABC):
         """Universal codec loader for all backends."""
         logger.info(f"📦 Loading codec from: {codec_repo} on {codec_device} ...")
 
-        if any(x in codec_repo.lower() for x in ["onnx", "vieneu-codec"]) or codec_repo == "neuphonic/neucodec-onnx-decoder-int8":
+        try:
+            from vieneu_utils.model_manager import ensure_model
+            resolved_codec = str(ensure_model(codec_repo, category="codec", check_update=False))
+        except Exception:
+            resolved_codec = codec_repo
+
+        if any(x in codec_repo.lower() for x in ["onnx", "vieneu-codec"]) or "onnx" in codec_repo.lower():
             if codec_device != "cpu":
                 logger.warning("⚠️ ONNX decoder only runs on CPU. Ignoring device selection.")
             try:
                 from .utils import NeuCodecOnnx
-                self.codec = NeuCodecOnnx.from_pretrained(codec_repo)
+                self.codec = NeuCodecOnnx.from_pretrained(resolved_codec)
                 self._is_onnx_codec = True
                 return
             except Exception as e:
                 logger.warning(f"Failed to load standalone ONNX decoder: {e}. Trying via neucodec package...")
                 try:
                     from neucodec import NeuCodecOnnxDecoder
-                    self.codec = NeuCodecOnnxDecoder.from_pretrained(codec_repo)
+                    self.codec = NeuCodecOnnxDecoder.from_pretrained(resolved_codec)
                     self._is_onnx_codec = True
                     return
                 except ImportError:
@@ -99,10 +105,10 @@ class BaseVieneuTTS(ABC):
                 logger.warning("⚠️ MPS not available for codec, falling back to CPU")
                 codec_device = "cpu"
 
-            if codec_repo == "neuphonic/neucodec":
-                self.codec = NeuCodec.from_pretrained(codec_repo)
-            elif codec_repo == "neuphonic/distill-neucodec":
-                self.codec = DistillNeuCodec.from_pretrained(codec_repo)
+            if "distill-neucodec" in codec_repo.lower() or "distill-neucodec" in resolved_codec.lower():
+                self.codec = DistillNeuCodec.from_pretrained(resolved_codec)
+            elif "neucodec" in codec_repo.lower() or "neucodec" in resolved_codec.lower():
+                self.codec = NeuCodec.from_pretrained(resolved_codec)
             else:
                 raise ValueError(f"Unrecognized codec repository: {codec_repo}")
 
