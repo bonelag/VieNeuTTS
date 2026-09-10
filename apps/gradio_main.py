@@ -1183,10 +1183,8 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
         # to single-utterance generation on CPU / 1 chunk / batching disabled.
         if "v3" in (current_backbone or "").lower():
             _t0 = time.time()
-            # v3 Nano shares this branch: its engine.infer(phonemes=, speaker_emb=, ref_codes=)
-            # has the same shape (ref_codes = the voice's style tokens) and its device is
-            # always CPU, so it takes the sequential path below.
-            v3_label = "v3 Nano" if "nano" in (current_backbone or "").lower() else "v3 Turbo"
+            is_nano = "nano" in (current_backbone or "").lower()
+            v3_label = "v3 Nano" if is_nano else "v3 Turbo"
             yield None, f"⏳ Đang tổng hợp ({v3_label})..."
             sr_v3 = getattr(tts, "sample_rate", 48000)
             try:

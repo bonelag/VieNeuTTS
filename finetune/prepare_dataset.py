@@ -64,7 +64,7 @@ def main() -> None:
     ap.add_argument("--audio-dir", default=None, help="default: <dataset-dir>/raw_audio if exists, else <dataset-dir>")
     ap.add_argument("--out", default=None, help="default: <dataset-dir>/train.parquet")
     ap.add_argument("--speaker", default="my_voice", help="speaker name for lines without a 3rd column")
-    ap.add_argument("--min-sec", type=float, default=0.3, help="shorter clips are skipped (default: 0.3s)")
+    ap.add_argument("--min-sec", type=float, default=0.2, help="shorter clips are skipped (default: 0.2s)")
     ap.add_argument("--max-sec", type=float, default=20.0, help="longer clips are skipped (split them first)")
     ap.add_argument("--base", default="pnnbao-ump/VieNeu-TTS-v3-Turbo", help="model repo (codec + speaker encoder)")
     args = ap.parse_args()
