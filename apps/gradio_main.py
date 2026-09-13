@@ -50,8 +50,6 @@ from apps.user_voices import (
 )
 from apps.ui_utils import (
     _format_duration,
-    _split_estimate_status,
-    wrap_with_estimate,
     cleanup_gpu_memory,
     get_ref_text_cached,
     validate_audio_duration,
@@ -698,6 +696,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                     tts._orig_preset_voices = dict(getattr(tts, "_preset_voices", {}))
                     tts._orig_default_voice = getattr(tts, "_default_voice", None)
 
+                    from peft import PeftModel
                     if current_adapter and current_adapter != "Không":
                         adapter_path = Path(_PROJECT_DIR) / "finetune" / "output" / current_adapter / "adapter"
                         if adapter_path.is_dir():
@@ -705,9 +704,15 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                                 print(f"⚠️ Adapter LoRA ({current_adapter}) yêu cầu GPU PyTorch. Bỏ qua nạp trên CPU ONNX.")
                             else:
                                 try:
-                                    from vieneu_lora.lora import load_adapter
                                     print(f"   🎛️ Nạp LoRA adapter: {current_adapter} từ {adapter_path}...")
-                                    tts.engine.model = load_adapter(tts._raw_base_model, str(adapter_path))
+                                    if not isinstance(tts.engine.model, PeftModel):
+                                        tts.engine.model = PeftModel.from_pretrained(tts.engine.model, str(adapter_path), adapter_name=current_adapter)
+                                    else:
+                                        if current_adapter not in tts.engine.model.peft_config:
+                                            tts.engine.model.load_adapter(str(adapter_path), adapter_name=current_adapter)
+                                        tts.engine.model.enable_adapter_layers()
+                                        tts.engine.model.set_adapter(current_adapter)
+
                                     if hasattr(tts.engine, "_step_graphs"):
                                         tts.engine._step_graphs.clear()
                                     preset_json = adapter_path / "voices_v3_turbo.json"
@@ -1658,11 +1663,13 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
 
 DEFAULT_CLONE_TEXT = "Xin chào, đây là giọng nói vừa được nhân bản từ đoạn audio mẫu của bạn. Nghe có giống không?"
 
-synthesize_speech_with_estimate = wrap_with_estimate(synthesize_speech)
-
-def synthesize_conversation_with_empty_estimate(*args):
-    for audio_path, status in synthesize_conversation(*args):
-        yield audio_path, status, ""
+def wrap_status(fn):
+    def wrapper(*args, **kwargs):
+        for audio_path, status in fn(*args, **kwargs):
+            if isinstance(status, str) and status and not status.strip().startswith("<div"):
+                status = f"<div class='status-live-msg'>{status}</div>"
+            yield audio_path, status
+    return wrapper
 
 # --- CANCELLATION ---
 # threading.Event is a mutable object: never reassigned, always the same reference.
@@ -2552,7 +2559,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 )
                 with gr.Group():
                     status_output = gr.HTML(
-                        value="<div class='status-live-msg'>Sẵn sàng</div>",
+                        value="<div class='status-live-msg'>Sẵn sàng</div>" if model_loaded else "<div class='status-live-msg'>Chưa tải model</div>",
                         label="Trạng thái",
                         show_label=True,
                         container=True,
@@ -2560,14 +2567,6 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     )
                 seed_cache_box = gr.Textbox(value="-1", elem_id="seed_cache_box", elem_classes=["hidden-bridge"])
                 btn_hidden_use_seed = gr.Button("Use", elem_id="btn_hidden_use_seed", elem_classes=["hidden-bridge"])
-                with gr.Group():
-                    estimate_output = gr.Textbox(
-                        label="Ước tính thời gian",
-                        elem_classes="estimate-box",
-                        lines=2,
-                        max_lines=4,
-                        show_copy_button=True
-                    )
                 download_btn = gr.DownloadButton(
                     "📥 Tải xuống file Audio",
                     variant="primary",
@@ -2710,10 +2709,11 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             return gr.update(choices=names, value=names[0] if names else None)
 
         def _after_model_load():
-            return gr.update(interactive=bool(model_loaded)), _user_voice_choices()
+            status_html = "<div class='status-live-msg'>Sẵn sàng</div>" if model_loaded else "<div class='status-live-msg'>Chưa tải model</div>"
+            return gr.update(interactive=bool(model_loaded)), _user_voice_choices(), gr.update(value=status_html)
 
-        btn_load.click(lambda: gr.update(interactive=False), outputs=btn_generate_clone)
-        load_event.then(_after_model_load, outputs=[btn_generate_clone, user_voice_dd])
+        btn_load.click(lambda: (gr.update(interactive=False), gr.update(value="<div class='status-live-msg'>⏳ Đang tải model...</div>")), outputs=[btn_generate_clone, status_output])
+        load_event.then(_after_model_load, outputs=[btn_generate_clone, user_voice_dd, status_output])
         
         # --- PDF Upload Event Handlers ---
         def on_pdf_upload(pdf_file):
@@ -2752,13 +2752,13 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         )
         
         conv_gen_event = btn_generate_conv.click(
-            fn=synthesize_conversation_with_empty_estimate,
+            fn=wrap_status(synthesize_conversation),
             inputs=[conv_script_input,
                     *speaker_name_boxes,
                     *speaker_voice_dds,
                     silence_slider, temperature_slider, max_chars_chunk_slider,
                     session_id_state],
-            outputs=[audio_output, status_output, estimate_output]
+            outputs=[audio_output, status_output]
         )
         btn_generate_conv.click(lambda: gr.update(visible=False), outputs=[download_btn])
         btn_generate_conv.click(lambda: gr.update(interactive=True), outputs=btn_stop)
@@ -2783,7 +2783,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         
         # --- Standard Generation Handlers ---
         gen_event = btn_generate.click(
-            fn=synthesize_speech_with_estimate,
+            fn=wrap_status(synthesize_speech),
             inputs=[text_input, voice_select, custom_audio, custom_text, current_mode_state,
                     generation_mode, use_batch, max_batch_size_run,
                     temperature_slider, max_chars_chunk_slider,
@@ -2791,7 +2791,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     seed_input,
                     top_p_slider, top_k_slider, repetition_penalty_slider, max_new_frames_slider,
                     denoise_checkbox, session_id_state],
-            outputs=[audio_output, status_output, estimate_output]
+            outputs=[audio_output, status_output]
         )
         btn_generate.click(lambda: gr.update(visible=False), outputs=[download_btn])
         btn_generate.click(lambda: gr.update(interactive=True), outputs=btn_stop)
@@ -2799,7 +2799,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
 
         # --- Voice Cloning: same synthesis path, clone mode, its own text box ---
         clone_gen_event = btn_generate_clone.click(
-            fn=synthesize_speech_with_estimate,
+            fn=wrap_status(synthesize_speech),
             inputs=[clone_text_input, voice_select, custom_audio, custom_text, clone_mode_state,
                     generation_mode, use_batch, max_batch_size_run,
                     temperature_slider, max_chars_chunk_slider,
@@ -2807,7 +2807,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     seed_input,
                     top_p_slider, top_k_slider, repetition_penalty_slider, max_new_frames_slider,
                     denoise_checkbox, session_id_state],
-            outputs=[audio_output, status_output, estimate_output]
+            outputs=[audio_output, status_output]
         )
         btn_generate_clone.click(lambda: gr.update(visible=False), outputs=[download_btn])
         btn_generate_clone.click(lambda: gr.update(interactive=True), outputs=btn_stop)
@@ -2914,17 +2914,15 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             if not hasattr(tts, "engine") or not hasattr(tts.engine, "model"):
                 return no_change
 
-            raw_model = getattr(tts, "_raw_base_model", None)
-            if raw_model is None:
-                raw_model = getattr(tts.engine.model, "get_base_model", lambda: tts.engine.model)()
-                tts._raw_base_model = raw_model
-
             if not hasattr(tts, "_orig_preset_voices"):
                 tts._orig_preset_voices = dict(getattr(tts, "_preset_voices", {}))
                 tts._orig_default_voice = getattr(tts, "_default_voice", None)
 
+            from peft import PeftModel
+
             if adapter_choice == "Không":
-                tts.engine.model = raw_model
+                if isinstance(tts.engine.model, PeftModel):
+                    tts.engine.model.disable_adapter_layers()
                 if hasattr(tts.engine, "_step_graphs"):
                     tts.engine._step_graphs.clear()
                 tts._preset_voices = dict(tts._orig_preset_voices)
@@ -2937,9 +2935,15 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     return no_change
 
                 try:
-                    from vieneu_lora.lora import load_adapter
                     print(f"🔄 Đang nạp LoRA adapter động: {adapter_choice}...")
-                    tts.engine.model = load_adapter(raw_model, str(adapter_path))
+                    if not isinstance(tts.engine.model, PeftModel):
+                        tts.engine.model = PeftModel.from_pretrained(tts.engine.model, str(adapter_path), adapter_name=adapter_choice)
+                    else:
+                        if adapter_choice not in tts.engine.model.peft_config:
+                            tts.engine.model.load_adapter(str(adapter_path), adapter_name=adapter_choice)
+                        tts.engine.model.enable_adapter_layers()
+                        tts.engine.model.set_adapter(adapter_choice)
+
                     if hasattr(tts.engine, "_step_graphs"):
                         tts.engine._step_graphs.clear()
 
@@ -2980,12 +2984,12 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         def request_stop():
             print("🛑 STOP REQUESTED via button click.")
             _STOP_EVENT.set()
-            return None, "⏹️ Đã dừng tạo giọng nói.", "", gr.update(interactive=False)
+            return None, "<div class='status-live-msg'>⏹️ Đã dừng tạo giọng nói.</div>", gr.update(interactive=False)
 
         # Handler: set stop event + update UI
         # Note: We avoid cancels= here to prevent internal Gradio KeyError crashes,
         # relying instead on the frequent _STOP_EVENT.is_set() checks in the code.
-        btn_stop.click(fn=request_stop, outputs=[audio_output, status_output, estimate_output, btn_stop])
+        btn_stop.click(fn=request_stop, outputs=[audio_output, status_output, btn_stop])
 
         # --- Download Button Event Handlers ---
         def on_audio_generated(audio_path):
@@ -3035,9 +3039,9 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             )
 
         srt_gen_event = btn_generate_srt.click(
-            fn=wrap_with_estimate(_srt_run),
+            fn=wrap_status(_srt_run),
             inputs=[srt_file, srt_voice, srt_keep_timing, srt_format, use_batch, max_batch_size_run],
-            outputs=[audio_output, status_output, estimate_output],
+            outputs=[audio_output, status_output],
         )
         btn_generate_srt.click(lambda: gr.update(visible=False), outputs=[download_btn])
         btn_generate_srt.click(lambda: gr.update(interactive=True), outputs=btn_stop)
@@ -3052,7 +3056,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         demo.load(
             fn=restore_ui_state,
             outputs=[model_status, btn_generate, btn_generate_conv, btn_stop]
-        ).then(_after_model_load, outputs=[btn_generate_clone, user_voice_dd])
+        ).then(_after_model_load, outputs=[btn_generate_clone, user_voice_dd, status_output])
 
 def main():
     # Cho phép override từ biến môi trường (hữu ích cho Docker)
