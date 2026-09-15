@@ -24,10 +24,11 @@
 > [!NOTE]
 > **🦜 VieNeu-TTS v3 Turbo is officially released!**
 > A brand-new architecture **designed and trained from scratch by Phạm Nguyễn Ngọc Bảo** (codec: [MOSS-Audio-Tokenizer-Nano](https://huggingface.co/OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano); phonemizer: [sea-g2p](https://github.com/pnnbao97/sea-g2p)):
+>
 > - **48 kHz** high-fidelity audio (up from 24 kHz).
 > - **Built-in default voices** — stable and consistent, no reference clip needed.
 > - **Natural reading style** everywhere — the style follows the reference voice (the `style` argument is deprecated and ignored).
-> - **Emotion / non-verbal cues** *(experimental)*: drop `[cười]`, `[thở dài]`, `[hắng giọng]` straight into the text.
+> - **Emotion / non-verbal cues** _(experimental)_: drop `[cười]`, `[thở dài]`, `[hắng giọng]` straight into the text.
 > - **Batched generation** (batch size up to 32), including a multi-speaker **Conversation** mode that batches the whole script regardless of speaker.
 > - **Instant voice cloning** from a 3–8s clip, with automatic reference denoising.
 >
@@ -64,7 +65,6 @@
   </tr>
 </table>
 
-
 ## 📌 Table of Contents
 
 1. [🦜 Installation & Web UI](#installation)
@@ -79,12 +79,15 @@
 ---
 
 ## 🦜 1. Installation & Web UI <a name="installation"></a>
+
 > [!TIP]
 > **On Windows?** The fastest way to get started is the standalone installer at **[vieneu.io/#/download](https://www.vieneu.io/#/download)** — no need to install `uv` or clone the repo manually.
 > **macOS**: a similar installer is coming in an upcoming release; for now, please use the `uv sync` steps below.
 
 ### Setup with `uv` (Recommended)
-`uv` is the fastest way to manage dependencies. 
+
+`uv` is the fastest way to manage dependencies.
+
 ```bash
 # Windows:
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
@@ -94,6 +97,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 1. **Clone the Repo:**
+
    ```bash
    git clone https://github.com/pnnbao97/VieNeu-TTS.git
    cd VieNeu-TTS
@@ -101,16 +105,17 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 2. **Install Dependencies:**
    - **Option 1: CPU & macOS (minimal, torch-free) — recommended for maximum speed** — runs **v3 Turbo via ONNX**
-     > 💡 *No GPU required. Installs only the lightweight ONNX stack; **v3 Turbo runs on CPU (48 kHz)** with default voices, voice cloning and emotion cues. PyTorch is never installed.*
+     > 💡 _No GPU required. Installs only the lightweight ONNX stack; **v3 Turbo runs on CPU (48 kHz)** with default voices, voice cloning and emotion cues. PyTorch is never installed._
      >
      > ⚡ **For the fastest CPU inference, install with `uv sync` — not `pip install`.** `uv sync` reproduces the locked environment that pins the optimized ONNX Runtime build, so you get maximum speed out of the box.
      >
-     > 🍎 **macOS users: use this option too.** For v3 Turbo the torch-free ONNX path on the CPU is *faster* than the MPS/PyTorch build (`--extra cuda`), so prefer `uv sync` for top speed on Apple Silicon.
+     > 🍎 **macOS users: use this option too.** For v3 Turbo the torch-free ONNX path on the CPU is _faster_ than the MPS/PyTorch build (`--extra cuda`), so prefer `uv sync` for top speed on Apple Silicon.
      ```bash
      uv sync
      ```
    - **Option 2: GPU** — **v3 Turbo on GPU (PyTorch)**
-     > 💡 The `cuda` extra adds only torch + transformers so **v3 Turbo runs on GPU** — inference is batched automatically on CUDA (same API, no code change). The legacy v1/v2 backends (LMDeploy, llama-cpp) live in `uv sync --group gpu`.*
+
+     > 💡 The `cuda` extra adds only torch + transformers so **v3 Turbo runs on GPU** — inference is batched automatically on CUDA (same API, no code change). The legacy v1/v2 backends (LMDeploy, llama-cpp) live in `uv sync --group gpu`.\*
 
      ```bash
      uv sync --extra cuda
@@ -120,10 +125,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
    ```bash
    uv run vieneu-web
    ```
-   Access the UI at `http://127.0.0.1:7860`.
+   Access the UI at `http://127.0.0.1:7536`.
 
 ---
-
 
 ## 📦 2. Using the Python SDK (vieneu) <a name="sdk"></a>
 
@@ -132,6 +136,7 @@ The `vieneu` SDK **defaults to VieNeu-TTS v3 Turbo (48 kHz)**. The minimal insta
 ### Quick Start
 
 **CPU (default)** — torch-free, runs v3 Turbo via ONNX Runtime. Most users want this:
+
 > ⚡**On CPU the backbone runs `fp32` by default** (maximum fidelity). Need more speed? Pass `Vieneu(precision="int8")` — ~1.6× faster and ~4× smaller, but it requires a CPU with VNNI (AVX-512 VNNI / AVX-VNNI); on older CPUs int8 can produce garbled audio. `precision` only affects the CPU/ONNX path; on GPU it's ignored (PyTorch).
 >
 > 🪶 **Still too slow, or deploying on a phone / ARM board?** Try **[VieNeu-TTS v3 Nano (preview)](#v3-nano)** — `Vieneu(mode="v3nano")`, ~3× faster than Turbo fp32 on CPU (RTF 0.11–0.22 on a desktop CPU), but **noticeably lower quality** (especially English / bilingual), 24 kHz, 11 preset voices + voice cloning. Details and caveats in the [v3 Nano section](#v3-nano) below.
@@ -140,7 +145,8 @@ The `vieneu` SDK **defaults to VieNeu-TTS v3 Turbo (48 kHz)**. The minimal insta
 pip install vieneu
 ```
 
-**GPU (CUDA)** — only if you have an NVIDIA GPU. On Linux `pip install "vieneu[cuda]"` is enough (PyPI torch ships CUDA there); on Windows install the CUDA torch **first** as below. 
+**GPU (CUDA)** — only if you have an NVIDIA GPU. On Linux `pip install "vieneu[cuda]"` is enough (PyPI torch ships CUDA there); on Windows install the CUDA torch **first** as below.
+
 > ℹ️ **How fast is the GPU path?** Since 3.7.0 every audio frame is **one CUDA
 > graph** (acoustic decoder + sampling + repetition penalty + backbone step in a
 > single replay — no `torch.compile`, no C++ toolchain needed). Measured on an
@@ -212,7 +218,7 @@ for label, voice_id in voices:
 
 #### Streaming (real-time) 🔊
 
-> v3 Turbo supports **frame-level streaming**: audio starts in ~300 ms and generation stays *ahead* of playback (RTF < 1 on CPU — ~2–3× on a laptop, ~7× on Apple Silicon), so it's ideal for realtime / interactive apps. Streaming runs on the > **ONNX/CPU** engine — low first-audio latency, frame-by-frame; the GPU/PyTorch engine is built for **batch throughput**, not streaming, so pin `backend="onnx"` for realtime. Just iterate `infer_stream`:
+> v3 Turbo supports **frame-level streaming**: audio starts in ~300 ms and generation stays _ahead_ of playback (RTF < 1 on CPU — ~2–3× on a laptop, ~7× on Apple Silicon), so it's ideal for realtime / interactive apps. Streaming runs on the > **ONNX/CPU** engine — low first-audio latency, frame-by-frame; the GPU/PyTorch engine is built for **batch throughput**, not streaming, so pin `backend="onnx"` for realtime. Just iterate `infer_stream`:
 
 ```python
 from vieneu import Vieneu
@@ -231,7 +237,7 @@ uv run python -m apps.web_stream                  # → http://127.0.0.1:8001
 
 The v3 Turbo engine includes **23 curated preset voices** covering **3 regions** (North, Central, South) with diverse genders and speaking characters:
 
-- **Northern (Bắc)**: e.g. Minh Quân *(default)*, Minh Đức, Phạm Tuyên, Trúc Ly, Mai Anh, Quỳnh Anh, Xuân Vĩnh, Anh Khôi, Mạnh Dũng
+- **Northern (Bắc)**: e.g. Minh Quân _(default)_, Minh Đức, Phạm Tuyên, Trúc Ly, Mai Anh, Quỳnh Anh, Xuân Vĩnh, Anh Khôi, Mạnh Dũng
 - **Central (Trung)**: Quang Sơn, Ngọc Trân
 - **Southern (Nam)**: e.g. Adam, Thái Sơn, Thùy Dung, Mỹ Duyên
 
@@ -310,6 +316,7 @@ wav, sr = vieneu.denoise("noisy.wav", out_path="clean.wav")   # 44.1 kHz mono
 > onnxruntime + soxr + kaldi-native-fbank). **v3 Nano** below clones the same way (its cloning graphs are fetched on first use).
 
 <a id="v3-nano"></a>
+
 ### v3 Nano (preview) — for edge devices / weak CPUs only 🪶
 
 > [!WARNING]
@@ -317,6 +324,7 @@ wav, sr = vieneu.denoise("noisy.wav", out_path="clean.wav")   # 44.1 kHz mono
 > too slow on your hardware (old laptops, mini PCs, ARM boards, CPUs without AVX-512/VNNI where
 > the int8 Turbo build produces garbled audio). Nano is a 48M-parameter flow-matching model
 > (ONNX, CPU, torch-free) and it **trades quality for speed**:
+>
 > - **Lower quality than v3 Turbo — most noticeably on English and code-switched (En-Vi) text.**
 >   Vietnamese is close; English words come out with a Vietnamese accent and are less stable.
 > - **24 kHz** output (Turbo: 48 kHz).
@@ -325,12 +333,12 @@ wav, sr = vieneu.denoise("noisy.wav", out_path="clean.wav")   # 44.1 kHz mono
 
 Measured on the same desktop CPU (12th-gen Intel i7, 6 ONNX Runtime threads, ~9 s of speech):
 
-| Engine | RTF ↓ | Sample rate | Load time |
-|---|---|---|---|
-| v3 Turbo ONNX fp32 (default on CPU) | 0.62 | 48 kHz | ~19 s |
-| v3 Turbo ONNX int8 | 0.37 | 48 kHz | ~14 s |
-| **v3 Nano, 16 steps, cfg 3** (default) | **0.22** | 24 kHz | ~3 s |
-| **v3 Nano, 8 steps, sway −1** | **0.11** | 24 kHz | ~3 s |
+| Engine                                 | RTF ↓    | Sample rate | Load time |
+| -------------------------------------- | -------- | ----------- | --------- |
+| v3 Turbo ONNX fp32 (default on CPU)    | 0.62     | 48 kHz      | ~19 s     |
+| v3 Turbo ONNX int8                     | 0.37     | 48 kHz      | ~14 s     |
+| **v3 Nano, 16 steps, cfg 3** (default) | **0.22** | 24 kHz      | ~3 s      |
+| **v3 Nano, 8 steps, sway −1**          | **0.11** | 24 kHz      | ~3 s      |
 
 RTF = compute time ÷ audio duration (lower is faster; 0.22 = 4.5× faster than real time). The ratio carries over to slower machines: expect Nano to be roughly **1.7× faster than Turbo int8** and **~3× faster than Turbo fp32**, with a 282 MB download instead of Turbo's.
 
@@ -368,23 +376,26 @@ Deploy VieNeu-TTS as a high-performance API Server (powered by LMDeploy) with a 
 **Requirement**: [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) is required for GPU support.
 
 **Start the Server with a Public Tunnel (No port forwarding needed):**
+
 ```bash
 docker run --gpus all -p 23333:23333 -v huggingface_cache:/root/.cache/huggingface pnnbao/vieneu-tts:latest --tunnel
 ```
 
-*   **Default**: The server loads the `VieNeu-TTS-v2` model for maximum quality.
-*   **Tunneling**: The Docker image includes a built-in `bore` tunnel. Check the container logs to find your public address (e.g., `bore.pub:31631`).
+- **Default**: The server loads the `VieNeu-TTS-v2` model for maximum quality.
+- **Tunneling**: The Docker image includes a built-in `bore` tunnel. Check the container logs to find your public address (e.g., `bore.pub:31631`).
 
 ### 2. Using the SDK (Remote Mode)
 
 Once the server is running, you can connect from anywhere (Colab, Web Apps, etc.) without loading heavy models locally.
 
 **Installation**:
+
 ```bash
 pip install "vieneu[legacy]"
 ```
 
 **Usage**:
+
 ```python
 from vieneu import Vieneu
 import os
@@ -427,9 +438,11 @@ if os.path.exists("examples/audio_ref/example_ngoc_huyen.wav"):
     vieneu.save(cloned_audio, "outputs/remote_cloned_output.wav")
     print("💾 Saved remote cloned voice to: outputs/remote_cloned_output.wav")
 ```
-*For full implementation details, see: [examples/main_remote.py](examples/main_remote.py)*
+
+_For full implementation details, see: [examples/main_remote.py](examples/main_remote.py)_
 
 ### Voice Preset Specification (v1.0)
+
 VieNeu-TTS uses the official `vieneu.voice.presets` specification to define reusable voice assets. Only `voices.json` files following this spec are guaranteed to be compatible with VieNeu-TTS SDK ≥ v1.x.
 
 ### 3. Advanced Configuration
@@ -437,6 +450,7 @@ VieNeu-TTS uses the official `vieneu.voice.presets` specification to define reus
 Customize the server to run specific versions or your own fine-tuned models.
 
 **Run the 0.3B Model (Faster):**
+
 ```bash
 docker run --gpus all pnnbao/vieneu-tts:serve --model pnnbao-ump/VieNeu-TTS-0.3B --tunnel
 ```
@@ -473,21 +487,21 @@ The merged model keeps the full v3 Turbo API (cloning, presets, streaming) on th
 
 ## 🔬 5. Model Overview <a name="backbones"></a>
 
-| Model | Format | Device | Bilingual | Features | Speed |
-|---|---|---|---|---|---|
-| **VieNeu-TTS-v3-Turbo** *(default)* | PyTorch/ONNX | **GPU/CPU** | ✅ | **48 kHz, Default voices, Cloning, Emotion cues, Conversation** | **Fast (batched)** |
-| **VieNeu-TTS-v3-Nano** *(preview)* | ONNX | **weak CPU / edge** | ⚠️ weak | 24 kHz, 11 preset voices, cloning, emotion cues — **lower quality (esp. English / En-Vi)** | **Fastest on CPU (RTF 0.11–0.22 desktop)** |
-| **VieNeu-TTS-v2** | PyTorch | **GPU** | ✅ | **Podcast, En-Vi CS** | **Fast (LMDeploy)** |
-| **VieNeu-v2-CPU** | GGUF/ONNX | **CPU/Edge** | ✅ | **Podcast, En-Vi CS** | **Extreme Speed** |
-| **VieNeu-v2-Turbo** | GGUF/ONNX | **CPU/Edge** | ✅ | Lightweight En-Vi | **Ultra Fast** |
-| **VieNeu-TTS (v1)** | PyTorch | GPU/CPU | ❌ | Stable (Vi only) | Standard |
+| Model                               | Format       | Device              | Bilingual | Features                                                                                   | Speed                                      |
+| ----------------------------------- | ------------ | ------------------- | --------- | ------------------------------------------------------------------------------------------ | ------------------------------------------ |
+| **VieNeu-TTS-v3-Turbo** _(default)_ | PyTorch/ONNX | **GPU/CPU**         | ✅        | **48 kHz, Default voices, Cloning, Emotion cues, Conversation**                            | **Fast (batched)**                         |
+| **VieNeu-TTS-v3-Nano** _(preview)_  | ONNX         | **weak CPU / edge** | ⚠️ weak   | 24 kHz, 11 preset voices, cloning, emotion cues — **lower quality (esp. English / En-Vi)** | **Fastest on CPU (RTF 0.11–0.22 desktop)** |
+| **VieNeu-TTS-v2**                   | PyTorch      | **GPU**             | ✅        | **Podcast, En-Vi CS**                                                                      | **Fast (LMDeploy)**                        |
+| **VieNeu-v2-CPU**                   | GGUF/ONNX    | **CPU/Edge**        | ✅        | **Podcast, En-Vi CS**                                                                      | **Extreme Speed**                          |
+| **VieNeu-v2-Turbo**                 | GGUF/ONNX    | **CPU/Edge**        | ✅        | Lightweight En-Vi                                                                          | **Ultra Fast**                             |
+| **VieNeu-TTS (v1)**                 | PyTorch      | GPU/CPU             | ❌        | Stable (Vi only)                                                                           | Standard                                   |
 
 ---
 
 ## 🚀 6. Roadmap <a name="roadmap"></a>
 
-- [x] **VieNeu-TTS v3 Turbo** *(on-device, personal use)*: from-scratch 48 kHz architecture — preset voices, instant voice cloning, emotion cues, batched generation, multi-speaker conversation, frame-level streaming; torch-free on CPU.
-- [x] **VieNeu-TTS v3 Nano** *(preview)*: 48M flow-matching model for weak CPUs / edge devices — 11 preset voices + cloning, torch-free.
+- [x] **VieNeu-TTS v3 Turbo** _(on-device, personal use)_: from-scratch 48 kHz architecture — preset voices, instant voice cloning, emotion cues, batched generation, multi-speaker conversation, frame-level streaming; torch-free on CPU.
+- [x] **VieNeu-TTS v3 Nano** _(preview)_: 48M flow-matching model for weak CPUs / edge devices — 11 preset voices + cloning, torch-free.
 - [x] **LoRA fine-tuning** for v3 Turbo — train your own voice or reading style on one consumer GPU.
 - [ ] **VieNeu-TTS v3 (GPU, server release)**: the full v3 model for API / server deployment — finalized quality, stable emotion control, more voices.
 - [ ] **Mobile SDK**: official Android / iOS deployment.
@@ -502,6 +516,7 @@ The merged model keeps the full v3 Turbo API (cloning, presets, streaming) on th
 - **License:** Apache 2.0 (Free to use).
 
 ---
+
 ## 📑 8. Citation <a name="citation"></a>
 
 ```bibtex

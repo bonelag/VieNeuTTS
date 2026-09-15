@@ -34,7 +34,7 @@ Chạy lệnh sau sẽ bật Web UI. Bạn cũng có thể mở terminal khác �
 docker compose -f docker/docker-compose.yml --profile gpu up
 ```
 
-Truy cập: **http://localhost:7860**
+Truy cập: **http://localhost:7536**
 
 ### 2. Chạy lệnh thủ công (Optional)
 
@@ -108,8 +108,8 @@ docker compose -f docker/docker-compose.prod.yml --profile gpu up -d
 
 Chúng tôi sử dụng Docker Compose Profiles để quản lý các variants:
 
-| Profile | Môi trường | File                      | Mô tả                                |
-| ------- | ---------- | ------------------------- | ------------------------------------ |
+| Profile | Môi trường | File                             | Mô tả                                |
+| ------- | ---------- | -------------------------------- | ------------------------------------ |
 | `gpu`   | **Dev**    | `docker/docker-compose.yml`      | Dev mode (Mount code + Web UI + GPU) |
 | `gpu`   | **Prod**   | `docker/docker-compose.prod.yml` | Run mode (Baked code + Web UI + GPU) |
 

@@ -831,7 +831,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS (XPU)", head=head_html) a
 
 def main():
     server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
-    server_port = int(os.getenv("GRADIO_SERVER_PORT", "7860"))
+    server_port = int(os.getenv("GRADIO_SERVER_PORT", "7536"))
 
     is_on_colab = os.getenv("COLAB_RELEASE_TAG") is not None
     share = env_bool("GRADIO_SHARE", default=is_on_colab)

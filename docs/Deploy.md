@@ -35,7 +35,7 @@ Run the following command to start the Web UI. You can also open another termina
 docker compose -f docker/docker-compose.yml --profile gpu up
 ```
 
-Access: **http://localhost:7860**
+Access: **http://localhost:7536**
 
 ### 2. Run Manual Commands (Optional)
 
@@ -122,7 +122,7 @@ make docker-build-serve
 make docker-push-serve
 ```
 
-*Note: The image is tagged `pnnbao97/vieneu-tts:serve` by default. Update the Makefile if you use a different registry.*
+_Note: The image is tagged `pnnbao97/vieneu-tts:serve` by default. Update the Makefile if you use a different registry._
 
 ### 2. User Experience
 
@@ -144,8 +144,8 @@ This image is optimized purely for serving the API (minimal size, pre-installed 
 
 We use Docker Compose Profiles to manage variants:
 
-| Profile | Environment | File                      | Description                          |
-| ------- | ----------- | ------------------------- | ------------------------------------ |
+| Profile | Environment | File                             | Description                          |
+| ------- | ----------- | -------------------------------- | ------------------------------------ |
 | `gpu`   | **Dev**     | `docker/docker-compose.yml`      | Dev mode (Mount code + Web UI + GPU) |
 | `gpu`   | **Prod**    | `docker/docker-compose.prod.yml` | Run mode (Baked code + Web UI + GPU) |
 

@@ -3061,7 +3061,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
 def main():
     # Cho phép override từ biến môi trường (hữu ích cho Docker)
     server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
-    server_port = int(os.getenv("GRADIO_SERVER_PORT", "7860"))
+    server_port = int(os.getenv("GRADIO_SERVER_PORT", "7536"))
 
     # Check running in Colab
     is_on_colab = os.getenv("COLAB_RELEASE_TAG") is not None

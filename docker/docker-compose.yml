@@ -9,12 +9,12 @@ x-base-config: &base-config
   environment:
     - HF_HOME=${HF_HOME:-/home/app/.cache/huggingface}
     - PYTHONUNBUFFERED=1
-    - PORT=${PORT:-7860}
-    - GRADIO_SERVER_PORT=${GRADIO_SERVER_PORT:-7860}
+    - PORT=${PORT:-7536}
+    - GRADIO_SERVER_PORT=${GRADIO_SERVER_PORT:-7536}
     - GRADIO_SERVER_NAME=${GRADIO_SERVER_NAME:-0.0.0.0}
     - GRADIO_SHARE=${GRADIO_SHARE:-0}
   ports:
-    - "${PORT:-7860}:${GRADIO_SERVER_PORT:-7860}"
+    - "${PORT:-7536}:${GRADIO_SERVER_PORT:-7536}"
   stdin_open: true
   tty: true
 

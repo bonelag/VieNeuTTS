@@ -2,7 +2,7 @@
 # Small image for laptops, mini PCs and servers without a GPU.
 #
 #   docker build -t vieneu-tts:cpu -f docker/Dockerfile.cpu .
-#   docker run -p 7860:7860 -v hf_cache:/home/app/.cache/huggingface vieneu-tts:cpu
+#   docker run -p 7536:7536 -v hf_cache:/home/app/.cache/huggingface vieneu-tts:cpu
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
@@ -12,7 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH="/workspace/src:/workspace" \
     HF_HOME=/home/app/.cache/huggingface \
     GRADIO_SERVER_NAME=0.0.0.0 \
-    GRADIO_SERVER_PORT=7860 \
+    GRADIO_SERVER_PORT=7536 \
     GRADIO_SHARE=0
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
@@ -31,5 +31,5 @@ COPY --chown=app:app config.yaml ./
 COPY --chown=app:app examples/audio_ref/ examples/audio_ref/
 
 USER app
-EXPOSE 7860
+EXPOSE 7536
 CMD ["python", "apps/gradio_main.py"]
