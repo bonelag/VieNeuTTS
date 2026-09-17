@@ -1,9 +1,9 @@
 {
   "meta": {
-    "note": "v3 turbo curated preset voices (named); `featured` 1..10 marks the editors' picks in display order",
+    "note": "v3 turbo curated preset voices (named); `featured` 1..10 marks the editors' picks in display order; `aliases` keeps old names working (voice=\"Minh Quân\" → \"Minh Quân Pro\")",
     "count": 26
   },
-  "default_voice": "Minh Quân",
+  "default_voice": "Minh Quân Pro",
   "presets": {
     "Adam bựa": {
       "description": "Nam · Bắc · Phong cách tự nhiên",
@@ -5785,7 +5785,7 @@
         ]
       ]
     },
-    "Minh Quân": {
+    "Minh Quân Pro": {
       "description": "Nam · Bắc · Phong cách tự nhiên",
       "featured": 5,
       "gender": "male",
@@ -7210,6 +7210,9 @@
           25,
           178
         ]
+      ],
+      "aliases": [
+        "Minh Quân"
       ]
     },
     "Thùy Dung": {
